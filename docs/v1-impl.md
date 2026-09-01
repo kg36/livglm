@@ -1,5 +1,10 @@
 # GLM-5.3-Flash ExpertSSD v1 implementation plan
 
+> Historical plan: the first-token path described here was completed. See
+> [`v1-status.md`](v1-status.md) for that milestone and
+> [`native-expertssd-status.md`](native-expertssd-status.md) for the current
+> native direct-to-slot implementation.
+
 Status: implementation plan only; no runtime code has been written as part of this document.
 
 Date: 2026-09-01

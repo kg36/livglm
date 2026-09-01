@@ -11,12 +11,13 @@ from typing import Callable
 
 import mlx.core as mx
 
-from .contract import ContractError, ModelContract
-from .expert_reader import NativeExpertReader, ReaderStats
+from .contract import ContractError, EXPERTS_PER_LAYER, ModelContract
+from .expert_reader import ReaderStats
 from .expert_source import NativeExpertSourcePlan, build_native_expert_source_plan
-from .expert_ssd import ExpertCacheStats, ExpertSSD
+from .expert_ssd import ExpertCacheStats
 from .model import GLMForCausalLM
 from .model_config import GLMTextConfig
+from .native_expert_ssd import NativeExpertPool, NativeExpertSSD
 from .resident_plan import ResidentSourcePlan, build_resident_source_plan
 from .resident_reader import NativeResidentReader, ResidentReaderStats
 
@@ -40,6 +41,8 @@ class RuntimeProfile:
     runtime_reserve_gib: float
     expert_capacity: int
     expert_cache_gib: float
+    planned_gib: float
+    budget_headroom_gib: float
     context_limit: int = CONTEXT_LIMIT
 
     def as_dict(self) -> dict[str, float | int]:
@@ -79,10 +82,15 @@ def resolve_runtime_profile(
             f"memory budget leaves capacity {affordable_capacity}, below routed top-k 8; "
             f"use at least {minimum:.1f} GiB"
         )
-    # V1 is intentionally fixed at top-k. Larger cache tuning belongs after the
-    # first-token route/I/O trace, even on a 256 GiB Studio.
-    capacity = MINIMUM_EXPERT_CAPACITY
+    capacity = min(EXPERTS_PER_LAYER, affordable_capacity)
     cache_gib = capacity * MOE_LAYER_COUNT * EXPERT_SLOT_BYTES / 2**30
+    planned_gib = resident_gib + RUNTIME_RESERVE_GIB + cache_gib
+    headroom_gib = effective - planned_gib
+    if headroom_gib < -1e-9:
+        raise ContractError(
+            f"resolved runtime plan exceeds --memory: {planned_gib:.3f} > "
+            f"{effective:.3f} GiB"
+        )
     return RuntimeProfile(
         requested_gib=requested,
         effective_gib=effective,
@@ -91,6 +99,8 @@ def resolve_runtime_profile(
         runtime_reserve_gib=RUNTIME_RESERVE_GIB,
         expert_capacity=capacity,
         expert_cache_gib=cache_gib,
+        planned_gib=planned_gib,
+        budget_headroom_gib=headroom_gib,
     )
 
 
@@ -107,7 +117,7 @@ class PreflightResult:
             "resident": self.resident_plan.as_dict(),
             "experts": self.expert_plan.as_dict(),
             "profile": self.profile.as_dict(),
-            "expert_backend": "ExpertSSD/native-MXFP4",
+            "expert_backend": "mlx-io-glm/direct-to-slot/native-MXFP4",
             "scalex": False,
         }
 
@@ -117,13 +127,63 @@ class GenerationStats:
     prompt_tokens: int
     generated_tokens: int
     elapsed_seconds: float
+    prefill_seconds: float
+    decode_seconds: float
+    decode_forwards: int
     stopped_on_eos: bool
     reader: ReaderStats
+    prefill_reader: ReaderStats
+    decode_reader: ReaderStats
     expert_caches: tuple[ExpertCacheStats, ...]
+    prefill_expert_caches: tuple[ExpertCacheStats, ...]
+    decode_expert_caches: tuple[ExpertCacheStats, ...]
+    active_memory_bytes: int
+    peak_memory_bytes: int
 
     @property
     def tokens_per_second(self) -> float:
         return self.generated_tokens / self.elapsed_seconds if self.elapsed_seconds else 0.0
+
+    @property
+    def decode_tokens_per_second(self) -> float:
+        return self.decode_forwards / self.decode_seconds if self.decode_seconds else 0.0
+
+
+def _reader_delta(after: ReaderStats, before: ReaderStats) -> ReaderStats:
+    return ReaderStats(
+        expert_loads=after.expert_loads - before.expert_loads,
+        logical_reads=after.logical_reads - before.logical_reads,
+        system_reads=after.system_reads - before.system_reads,
+        read_bytes=after.read_bytes - before.read_bytes,
+        open_shards=after.open_shards,
+        backend=after.backend,
+        direct_to_slot=after.direct_to_slot,
+        read_seconds=after.read_seconds - before.read_seconds,
+        io_wait_seconds=after.io_wait_seconds - before.io_wait_seconds,
+        wired_bytes=after.wired_bytes,
+    )
+
+
+def _cache_delta(
+    after: tuple[ExpertCacheStats, ...],
+    before: tuple[ExpertCacheStats, ...],
+) -> tuple[ExpertCacheStats, ...]:
+    if len(after) != len(before):
+        raise RuntimeError("ExpertSSD cache inventory changed during generation")
+    return tuple(
+        ExpertCacheStats(
+            layer=end.layer,
+            capacity=end.capacity,
+            resident=end.resident,
+            hits=end.hits - start.hits,
+            misses=end.misses - start.misses,
+            evictions=end.evictions - start.evictions,
+            route_sync_seconds=end.route_sync_seconds - start.route_sync_seconds,
+            slot_plan_seconds=end.slot_plan_seconds - start.slot_plan_seconds,
+            policy=end.policy,
+        )
+        for end, start in zip(after, before, strict=True)
+    )
 
 
 class TargetRuntime:
@@ -136,9 +196,11 @@ class TargetRuntime:
         config: GLMTextConfig,
         profile: RuntimeProfile,
         model: GLMForCausalLM,
-        expert_reader: NativeExpertReader,
+        expert_reader: NativeExpertPool,
         resident_stats: ResidentReaderStats,
         tokenizer,
+        active_memory_bytes: int,
+        peak_memory_bytes: int,
     ):
         self.model_dir = model_dir
         self.config = config
@@ -147,6 +209,8 @@ class TargetRuntime:
         self.expert_reader = expert_reader
         self.resident_stats = resident_stats
         self.tokenizer = tokenizer
+        self.active_memory_bytes = active_memory_bytes
+        self.peak_memory_bytes = peak_memory_bytes
 
     @classmethod
     def preflight(
@@ -178,10 +242,11 @@ class TargetRuntime:
         preflight = cls.preflight(model_dir, memory_gib=memory_gib)
         contract = ModelContract.from_model_dir(preflight.model_dir)
         config = GLMTextConfig.from_model_dict(contract.config)
-        expert_reader = NativeExpertReader(preflight.expert_plan)
+        expert_reader = NativeExpertPool(preflight.expert_plan, workers=8)
+        memory_limit_bytes = int(preflight.profile.effective_gib * 2**30)
 
-        def make_experts(layer: int) -> ExpertSSD:
-            return ExpertSSD(
+        def make_experts(layer: int) -> NativeExpertSSD:
+            return NativeExpertSSD(
                 expert_reader,
                 layer=layer,
                 capacity=preflight.profile.expert_capacity,
@@ -189,6 +254,9 @@ class TargetRuntime:
             )
 
         try:
+            mx.set_memory_limit(memory_limit_bytes)
+            mx.set_cache_limit(512 * 2**20)
+            mx.reset_peak_memory()
             # Transformers is used only for tokenization; model-backend and
             # missing-PyTorch notices are irrelevant and otherwise look fatal.
             os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
@@ -203,16 +271,20 @@ class TargetRuntime:
                 context_limit=preflight.profile.context_limit,
                 expert_factory=make_experts,
             )
-            try:
-                mx.set_cache_limit(512 * 2**20)
-            except AttributeError:
-                pass
             resident_stats = NativeResidentReader(preflight.resident_plan).load_into(model)
             mx.eval(model.parameters())
             try:
                 mx.clear_cache()
             except AttributeError:
                 pass
+            active_memory_bytes = int(mx.get_active_memory())
+            peak_memory_bytes = int(mx.get_peak_memory())
+            if active_memory_bytes > memory_limit_bytes:
+                raise ContractError(
+                    f"active MLX memory exceeded --memory: "
+                    f"{active_memory_bytes / 2**30:.3f} > "
+                    f"{preflight.profile.effective_gib:.3f} GiB"
+                )
         except BaseException:
             expert_reader.close()
             raise
@@ -224,9 +296,13 @@ class TargetRuntime:
             expert_reader=expert_reader,
             resident_stats=resident_stats,
             tokenizer=tokenizer,
+            active_memory_bytes=active_memory_bytes,
+            peak_memory_bytes=peak_memory_bytes,
         )
 
     def close(self) -> None:
+        for layer in self.model.expert_layers():
+            layer.experts.close()
         self.expert_reader.close()
 
     def encode_messages(self, messages: list[dict[str, str]], *, thinking: bool) -> list[int]:
@@ -271,6 +347,8 @@ class TargetRuntime:
 
         cache = self.model.empty_cache()
         logits = None
+        reader_start = self.expert_reader.stats()
+        caches_start = tuple(layer.experts.stats() for layer in self.model.expert_layers())
         started = time.perf_counter()
         for token in prompt_ids:
             logits = self.model(mx.array([[token]], dtype=mx.int32), cache)
@@ -278,9 +356,16 @@ class TargetRuntime:
             if not bool(mx.all(mx.isfinite(logits)).item()):
                 raise ContractError("non-finite output logits during prompt execution")
         assert logits is not None
+        prefill_seconds = time.perf_counter() - started
+        reader_after_prefill = self.expert_reader.stats()
+        caches_after_prefill = tuple(
+            layer.experts.stats() for layer in self.model.expert_layers()
+        )
 
         generated: list[int] = []
         stopped = False
+        decode_forwards = 0
+        decode_started = time.perf_counter()
         for step in range(limit):
             token = int(mx.argmax(logits[0, -1], axis=-1).item())
             generated.append(token)
@@ -292,15 +377,27 @@ class TargetRuntime:
             if step + 1 < limit:
                 logits = self.model(mx.array([[token]], dtype=mx.int32), cache)
                 mx.eval(logits)
+                decode_forwards += 1
                 if not bool(mx.all(mx.isfinite(logits)).item()):
                     raise ContractError("non-finite output logits during generation")
+        decode_seconds = time.perf_counter() - decode_started
         elapsed = time.perf_counter() - started
-        caches = tuple(layer.experts.stats() for layer in self.model.expert_layers())
+        reader_end = self.expert_reader.stats()
+        caches_end = tuple(layer.experts.stats() for layer in self.model.expert_layers())
         return generated, GenerationStats(
             prompt_tokens=len(prompt_ids),
             generated_tokens=len(generated),
             elapsed_seconds=elapsed,
+            prefill_seconds=prefill_seconds,
+            decode_seconds=decode_seconds,
+            decode_forwards=decode_forwards,
             stopped_on_eos=stopped,
-            reader=self.expert_reader.stats(),
-            expert_caches=caches,
+            reader=_reader_delta(reader_end, reader_start),
+            prefill_reader=_reader_delta(reader_after_prefill, reader_start),
+            decode_reader=_reader_delta(reader_end, reader_after_prefill),
+            expert_caches=_cache_delta(caches_end, caches_start),
+            prefill_expert_caches=_cache_delta(caches_after_prefill, caches_start),
+            decode_expert_caches=_cache_delta(caches_end, caches_after_prefill),
+            active_memory_bytes=int(mx.get_active_memory()),
+            peak_memory_bytes=int(mx.get_peak_memory()),
         )

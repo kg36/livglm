@@ -16,7 +16,10 @@ fi
 python_bin="$project_root/.venv/bin/python"
 "$python_bin" -m pip install --upgrade pip
 "$python_bin" -m pip install -e "${project_root}[dev]"
-"$python_bin" -m pytest
+print "==> Building the pinned mlx-io-glm native wheel"
+"$project_root/scripts/build_native_mlx.sh"
+PYTHONPATH="$project_root/native/testsite:$project_root/src" \
+  "$python_bin" -m pytest
 
 print "Build and unit tests complete."
 print "No full model run was performed. On the clean machine, try:"

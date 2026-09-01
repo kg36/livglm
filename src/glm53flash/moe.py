@@ -11,6 +11,7 @@ from .contract import ContractError
 from .expert_ssd import ExpertSSD
 from .layers import DenseMLP, require_weight
 from .model_config import GLMTextConfig
+from .native_expert_ssd import NativeExpertSSD
 
 
 class TopKRouter(nn.Module):
@@ -60,7 +61,8 @@ class TopKRouter(nn.Module):
         return logits, weights, indices
 
 
-ExpertSSDFactory = Callable[[int], ExpertSSD]
+ExpertSSDBackend = ExpertSSD | NativeExpertSSD
+ExpertSSDFactory = Callable[[int], ExpertSSDBackend]
 
 
 class ExpertSSDMoE(nn.Module):
@@ -77,7 +79,7 @@ class ExpertSSDMoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.gate = TopKRouter(config)
         self.experts = expert_factory(layer_idx)
-        if not isinstance(self.experts, ExpertSSD):
+        if not isinstance(self.experts, (ExpertSSD, NativeExpertSSD)):
             raise ContractError(
                 f"sparse layer {layer_idx} must be backed by ExpertSSD, got "
                 f"{type(self.experts).__name__}"
@@ -93,8 +95,16 @@ class ExpertSSDMoE(nn.Module):
         original_shape = hidden_states.shape
         rows = hidden_states.reshape(-1, self.hidden_size)
         _, weights, indices = self.gate(rows)
-        route_outputs = self.experts(rows, indices)
+        if isinstance(self.experts, NativeExpertSSD):
+            # Native reads run on I/O workers while the independent resident
+            # shared expert executes on Metal.
+            route_plan = self.experts.prepare(indices)
+            shared = self.shared_experts(rows)
+            mx.async_eval(shared)
+            route_outputs = self.experts.finish(rows, route_plan)
+        else:
+            route_outputs = self.experts(rows, indices)
+            shared = self.shared_experts(rows)
         routed = mx.sum(route_outputs * weights[..., None], axis=-2)
-        self.last_route = tuple(int(value) for value in indices.reshape(-1).tolist())
-        shared = self.shared_experts(rows)
+        self.last_route = self.experts.last_expert_ids
         return (routed + shared).reshape(original_shape)

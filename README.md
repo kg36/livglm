@@ -17,11 +17,12 @@ The downloader uses HTTP byte ranges and writes directly into the final
 safetensors layout. It does not keep full copies of either source model. Work
 is resumable at 256 MiB boundaries and no Git repository is required.
 
-The runtime is a text-only, correctness-first MLX implementation. All 42
-routed MoE layers are required to use **ExpertSSD**: native MXFP4 expert records
-remain in the composite safetensors files and only the eight experts selected
-for the current token are loaded into each layer's bounded LRU. There is no
-full resident expert-bank fallback and v1 does not use ScaleX.
+The runtime is a text-only MLX implementation. All 42 routed MoE layers are
+required to use **ExpertSSD**: native MXFP4 expert records remain in the
+composite safetensors files and `mlx-io-glm` reads misses directly into fixed,
+wired per-layer slot arrays. A native Markov-LHD policy reuses experts across
+tokens, while eight workers issue independent SSD reads in parallel. There is
+no full resident expert-bank fallback and the runtime does not use ScaleX.
 
 Default artifact location:
 
@@ -47,8 +48,8 @@ until validation has completed.
 
 ## Runtime
 
-Build the Python 3.13 environment and run unit tests (this does not load or run
-the full model):
+Build the Python 3.13 environment, the pinned `mlx-io-glm` overlay, and run unit
+tests (this does not load or run the full model):
 
 ```bash
 ./build.sh
@@ -63,14 +64,18 @@ The command UX follows the DeepSeek project:
 ./run.sh --thinking --max-tokens 8 "Explain mHC briefly."
 ```
 
-V1 deliberately runs the prompt one token at a time, uses recurrent KDA, and
-fixes ExpertSSD capacity at eight per layer even when more memory is requested.
-It caps the total prompt-plus-output context at 128 tokens. DSA uses its real MLA
-projections but skips indexer scoring only inside the mathematically equivalent
-short-context domain where every visible key fits within the official 2,048-key
-selection budget. Vision, MTP, chunked prefill, ScaleX, and performance tuning
-are deferred until after the first-token correctness run.
+`--memory` is a hard total MLX runtime ceiling, not an expert-cache allowance.
+The runtime first reserves the resident graph and 3 GiB of execution headroom,
+then converts only the remainder into equal-capacity ExpertSSD caches across all
+42 routed layers. For example, `--memory 30` selects 19 slots per layer and a
+29.553 GiB total plan. The prompt still runs one token at a time through
+recurrent KDA, and total prompt-plus-output context is capped at 128 tokens.
+DSA uses its real MLA projections but skips indexer scoring only inside the
+mathematically equivalent short-context domain where every visible key fits
+within the official 2,048-key selection budget. Vision, MTP, chunked prefill,
+and ScaleX remain outside this runtime.
 
-See [`docs/v1-impl.md`](docs/v1-impl.md) for the implementation and
-qualification plan and [`docs/v1-status.md`](docs/v1-status.md) for the exact
-tested/unrun boundary of the current code.
+See [`docs/v1-impl.md`](docs/v1-impl.md) for the original correctness plan,
+[`docs/v1-status.md`](docs/v1-status.md) for the first-token milestone, and
+[`docs/native-expertssd-status.md`](docs/native-expertssd-status.md) for the
+current native implementation and measurements.

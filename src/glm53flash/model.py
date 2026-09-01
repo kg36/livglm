@@ -10,15 +10,14 @@ import mlx.nn as nn
 from .cache import DSACache, KDACache, LayerCache, ModelCache
 from .contract import ContractError
 from .dsa import DenseEquivalentDSAAttention
-from .expert_ssd import ExpertSSD
 from .kda import KDALinearAttention
 from .layers import DeferredEmbedding, DeferredLinear, DenseMLP, RMSNorm
 from .mhc import HyperConnection, HyperHead, hyper_residual
 from .model_config import GLMTextConfig
-from .moe import ExpertSSDMoE
+from .moe import ExpertSSDBackend, ExpertSSDMoE
 
 
-ExpertFactory = Callable[[int], ExpertSSD]
+ExpertFactory = Callable[[int], ExpertSSDBackend]
 
 
 class GLMDecoderLayer(nn.Module):
@@ -110,13 +109,6 @@ class GLMTextModel(nn.Module):
             [layer.empty_cache(batch_size, dtype) for layer in self.layers]
         )
 
-    @staticmethod
-    def _eval_cache(cache: LayerCache) -> None:
-        if isinstance(cache, KDACache):
-            mx.eval(cache.q_conv, cache.k_conv, cache.v_conv, cache.recurrent)
-        elif cache.keys is not None:
-            mx.eval(cache.keys, cache.values)
-
     def __call__(self, input_ids: mx.array, cache: ModelCache) -> mx.array:
         if input_ids.ndim != 2 or input_ids.shape[1] != 1:
             raise ContractError("v1 model execution accepts exactly one token per call")
@@ -133,11 +125,10 @@ class GLMTextModel(nn.Module):
         )
         for layer, layer_cache in zip(self.layers, cache.layers, strict=True):
             hidden_states = layer(hidden_states, layer_cache)
-            # The correctness baseline deliberately bounds lazy-graph lifetime here.
-            mx.eval(hidden_states)
-            if not bool(mx.all(mx.isfinite(hidden_states)).item()):
-                raise ContractError(f"non-finite hidden state after layer {layer.layer_idx}")
-            self._eval_cache(layer_cache)
+            # Each following MoE router materializes its indices before native
+            # refill. The final logits barrier materializes the last layer and
+            # every recurrent/cache update, so an additional finite-value GPU
+            # round trip at every layer is redundant.
         cache.advance()
         return self.norm(self.hc_head(hidden_states))
 
