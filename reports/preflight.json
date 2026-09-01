@@ -1,0 +1,156 @@
+{
+  "status": "PASS",
+  "sources": {
+    "official_remainder": {
+      "repo": "zai-org/GLM-5.3-Flash",
+      "revision": "03eb5366286afd40d2221b1d9c63a6dd1ba4832e"
+    },
+    "mxfp4_experts": {
+      "repo": "INCModel3/GLM-5.3-Flash-MXFP4-Mixed-CT-AutoRound",
+      "revision": "8712b4a299e2cbb81c019d2c20084fb99cbc2d00"
+    },
+    "bf16_validation": {
+      "repo": "zai-org/GLM-5.3-Flash-BF16",
+      "revision": "61f77a1e1a67c410650ce5017411337da0dcd11a"
+    }
+  },
+  "inventory": {
+    "official_routed_tensors_replaced": 74304,
+    "official_remainder_tensors": 1804,
+    "mxfp4_expert_tensors": 74304
+  },
+  "samples": [
+    {
+      "layer": 3,
+      "expert": 0,
+      "projection": "gate_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.9937819838523865,
+      "nrmse": 0.11365894973278046
+    },
+    {
+      "layer": 3,
+      "expert": 0,
+      "projection": "up_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.9942499995231628,
+      "nrmse": 0.11122996360063553
+    },
+    {
+      "layer": 3,
+      "expert": 0,
+      "projection": "down_proj",
+      "shape": [
+        4096,
+        2048
+      ],
+      "cosine": 0.9933821558952332,
+      "nrmse": 0.11646944284439087
+    },
+    {
+      "layer": 10,
+      "expert": 0,
+      "projection": "gate_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.9939125180244446,
+      "nrmse": 0.11224778741598129
+    },
+    {
+      "layer": 10,
+      "expert": 0,
+      "projection": "up_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.9934542775154114,
+      "nrmse": 0.11574731767177582
+    },
+    {
+      "layer": 10,
+      "expert": 0,
+      "projection": "down_proj",
+      "shape": [
+        4096,
+        2048
+      ],
+      "cosine": 0.9928779006004333,
+      "nrmse": 0.12009625136852264
+    },
+    {
+      "layer": 44,
+      "expert": 0,
+      "projection": "gate_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.9939635396003723,
+      "nrmse": 0.1123206838965416
+    },
+    {
+      "layer": 44,
+      "expert": 0,
+      "projection": "up_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.9940473437309265,
+      "nrmse": 0.1121520847082138
+    },
+    {
+      "layer": 44,
+      "expert": 0,
+      "projection": "down_proj",
+      "shape": [
+        4096,
+        2048
+      ],
+      "cosine": 0.994339108467102,
+      "nrmse": 0.11025668680667877
+    },
+    {
+      "layer": 45,
+      "expert": 0,
+      "projection": "gate_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.993535041809082,
+      "nrmse": 0.11353772133588791
+    },
+    {
+      "layer": 45,
+      "expert": 0,
+      "projection": "up_proj",
+      "shape": [
+        2048,
+        4096
+      ],
+      "cosine": 0.9933097958564758,
+      "nrmse": 0.11548027396202087
+    },
+    {
+      "layer": 45,
+      "expert": 0,
+      "projection": "down_proj",
+      "shape": [
+        4096,
+        2048
+      ],
+      "cosine": 0.9936307668685913,
+      "nrmse": 0.11269502341747284
+    }
+  ]
+}

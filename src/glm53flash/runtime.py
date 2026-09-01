@@ -1,0 +1,306 @@
+"""First-token GLM runtime assembly and token-at-a-time generation."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import math
+import os
+from pathlib import Path
+import time
+from typing import Callable
+
+import mlx.core as mx
+
+from .contract import ContractError, ModelContract
+from .expert_reader import NativeExpertReader, ReaderStats
+from .expert_source import NativeExpertSourcePlan, build_native_expert_source_plan
+from .expert_ssd import ExpertCacheStats, ExpertSSD
+from .model import GLMForCausalLM
+from .model_config import GLMTextConfig
+from .resident_plan import ResidentSourcePlan, build_resident_source_plan
+from .resident_reader import NativeResidentReader, ResidentReaderStats
+
+
+DEFAULT_MODEL_DIR = Path("/Users/kumargaurav/Documents/livglm/GLM53Flash")
+DEFAULT_MEMORY_GIB = 24.0
+SYSTEM_RESERVE_GIB = 4.0
+RUNTIME_RESERVE_GIB = 3.0
+CONTEXT_LIMIT = 128
+EXPERT_SLOT_BYTES = 13_369_344
+MOE_LAYER_COUNT = 42
+MINIMUM_EXPERT_CAPACITY = 8
+
+
+@dataclass(frozen=True)
+class RuntimeProfile:
+    requested_gib: float
+    effective_gib: float
+    physical_gib: float
+    resident_gib: float
+    runtime_reserve_gib: float
+    expert_capacity: int
+    expert_cache_gib: float
+    context_limit: int = CONTEXT_LIMIT
+
+    def as_dict(self) -> dict[str, float | int]:
+        return asdict(self)
+
+
+def physical_memory_bytes() -> int:
+    pages = int(os.sysconf("SC_PHYS_PAGES"))
+    page_bytes = int(os.sysconf("SC_PAGE_SIZE"))
+    total = pages * page_bytes
+    if total <= 0:
+        raise ContractError("cannot determine physical memory")
+    return total
+
+
+def resolve_runtime_profile(
+    requested_gib: float | None,
+    *,
+    resident_bytes: int = 17_842_600_184,
+    physical_bytes: int | None = None,
+) -> RuntimeProfile:
+    physical_gib = (physical_bytes or physical_memory_bytes()) / 2**30
+    requested = DEFAULT_MEMORY_GIB if requested_gib is None else float(requested_gib)
+    if not math.isfinite(requested) or requested <= 0:
+        raise ContractError("--memory must be a positive finite number")
+    effective = min(requested, physical_gib - SYSTEM_RESERVE_GIB)
+    resident_gib = resident_bytes / 2**30
+    available = (effective - resident_gib - RUNTIME_RESERVE_GIB) * 2**30
+    affordable_capacity = math.floor(available / (MOE_LAYER_COUNT * EXPERT_SLOT_BYTES))
+    if affordable_capacity < MINIMUM_EXPERT_CAPACITY:
+        minimum = (
+            resident_gib
+            + RUNTIME_RESERVE_GIB
+            + MINIMUM_EXPERT_CAPACITY * MOE_LAYER_COUNT * EXPERT_SLOT_BYTES / 2**30
+        )
+        raise ContractError(
+            f"memory budget leaves capacity {affordable_capacity}, below routed top-k 8; "
+            f"use at least {minimum:.1f} GiB"
+        )
+    # V1 is intentionally fixed at top-k. Larger cache tuning belongs after the
+    # first-token route/I/O trace, even on a 256 GiB Studio.
+    capacity = MINIMUM_EXPERT_CAPACITY
+    cache_gib = capacity * MOE_LAYER_COUNT * EXPERT_SLOT_BYTES / 2**30
+    return RuntimeProfile(
+        requested_gib=requested,
+        effective_gib=effective,
+        physical_gib=physical_gib,
+        resident_gib=resident_gib,
+        runtime_reserve_gib=RUNTIME_RESERVE_GIB,
+        expert_capacity=capacity,
+        expert_cache_gib=cache_gib,
+    )
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    model_dir: str
+    resident_plan: ResidentSourcePlan
+    expert_plan: NativeExpertSourcePlan
+    profile: RuntimeProfile
+
+    def as_dict(self) -> dict:
+        return {
+            "model_dir": self.model_dir,
+            "resident": self.resident_plan.as_dict(),
+            "experts": self.expert_plan.as_dict(),
+            "profile": self.profile.as_dict(),
+            "expert_backend": "ExpertSSD/native-MXFP4",
+            "scalex": False,
+        }
+
+
+@dataclass(frozen=True)
+class GenerationStats:
+    prompt_tokens: int
+    generated_tokens: int
+    elapsed_seconds: float
+    stopped_on_eos: bool
+    reader: ReaderStats
+    expert_caches: tuple[ExpertCacheStats, ...]
+
+    @property
+    def tokens_per_second(self) -> float:
+        return self.generated_tokens / self.elapsed_seconds if self.elapsed_seconds else 0.0
+
+
+class TargetRuntime:
+    """Loaded resident graph plus one shared native expert reader."""
+
+    def __init__(
+        self,
+        *,
+        model_dir: Path,
+        config: GLMTextConfig,
+        profile: RuntimeProfile,
+        model: GLMForCausalLM,
+        expert_reader: NativeExpertReader,
+        resident_stats: ResidentReaderStats,
+        tokenizer,
+    ):
+        self.model_dir = model_dir
+        self.config = config
+        self.profile = profile
+        self.model = model
+        self.expert_reader = expert_reader
+        self.resident_stats = resident_stats
+        self.tokenizer = tokenizer
+
+    @classmethod
+    def preflight(
+        cls,
+        model_dir: str | Path = DEFAULT_MODEL_DIR,
+        *,
+        memory_gib: float | None = None,
+        physical_bytes: int | None = None,
+    ) -> PreflightResult:
+        contract = ModelContract.from_model_dir(model_dir)
+        contract.validate_supported_profile()
+        config = GLMTextConfig.from_model_dict(contract.config)
+        resident = build_resident_source_plan(contract)
+        experts = build_native_expert_source_plan(contract, config)
+        profile = resolve_runtime_profile(
+            memory_gib,
+            resident_bytes=resident.destination_bytes,
+            physical_bytes=physical_bytes,
+        )
+        return PreflightResult(str(contract.model_dir), resident, experts, profile)
+
+    @classmethod
+    def load(
+        cls,
+        model_dir: str | Path = DEFAULT_MODEL_DIR,
+        *,
+        memory_gib: float | None = None,
+    ) -> "TargetRuntime":
+        preflight = cls.preflight(model_dir, memory_gib=memory_gib)
+        contract = ModelContract.from_model_dir(preflight.model_dir)
+        config = GLMTextConfig.from_model_dict(contract.config)
+        expert_reader = NativeExpertReader(preflight.expert_plan)
+
+        def make_experts(layer: int) -> ExpertSSD:
+            return ExpertSSD(
+                expert_reader,
+                layer=layer,
+                capacity=preflight.profile.expert_capacity,
+                swiglu_limit=config.swiglu_limit,
+            )
+
+        try:
+            # Transformers is used only for tokenization; model-backend and
+            # missing-PyTorch notices are irrelevant and otherwise look fatal.
+            os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                preflight.model_dir,
+                trust_remote_code=False,
+            )
+            model = GLMForCausalLM(
+                config,
+                context_limit=preflight.profile.context_limit,
+                expert_factory=make_experts,
+            )
+            try:
+                mx.set_cache_limit(512 * 2**20)
+            except AttributeError:
+                pass
+            resident_stats = NativeResidentReader(preflight.resident_plan).load_into(model)
+            mx.eval(model.parameters())
+            try:
+                mx.clear_cache()
+            except AttributeError:
+                pass
+        except BaseException:
+            expert_reader.close()
+            raise
+        return cls(
+            model_dir=Path(preflight.model_dir),
+            config=config,
+            profile=preflight.profile,
+            model=model,
+            expert_reader=expert_reader,
+            resident_stats=resident_stats,
+            tokenizer=tokenizer,
+        )
+
+    def close(self) -> None:
+        self.expert_reader.close()
+
+    def encode_messages(self, messages: list[dict[str, str]], *, thinking: bool) -> list[int]:
+        encoded = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            add_generation_prompt=True,
+            clear_thinking=not thinking,
+            reasoning_effort="max",
+        )
+        input_ids = [int(value) for value in encoded["input_ids"]]
+        if not thinking:
+            # GLM's official generation prompt always opens `<think>`. Match
+            # the DeepSeek CLI's non-thinking UX by closing that empty section
+            # before generation; `clear_thinking` only controls old messages.
+            end_thinking = self.tokenizer.encode("</think>", add_special_tokens=False)
+            if len(end_thinking) != 1:
+                raise ContractError(
+                    "official tokenizer no longer has a single </think> token"
+                )
+            input_ids.append(int(end_thinking[0]))
+        return input_ids
+
+    def generate(
+        self,
+        prompt_ids: list[int],
+        *,
+        max_new_tokens: int | None = None,
+        on_token: Callable[[int, list[int]], None] | None = None,
+    ) -> tuple[list[int], GenerationStats]:
+        if not prompt_ids:
+            raise ContractError("prompt tokenization produced no tokens")
+        remaining = self.profile.context_limit - len(prompt_ids)
+        if remaining <= 0:
+            raise ContractError(
+                f"prompt has {len(prompt_ids)} tokens; v1 limit is {self.profile.context_limit}"
+            )
+        limit = remaining if max_new_tokens is None else min(int(max_new_tokens), remaining)
+        if limit < 1:
+            raise ContractError("--max-tokens must be positive")
+
+        cache = self.model.empty_cache()
+        logits = None
+        started = time.perf_counter()
+        for token in prompt_ids:
+            logits = self.model(mx.array([[token]], dtype=mx.int32), cache)
+            mx.eval(logits)
+            if not bool(mx.all(mx.isfinite(logits)).item()):
+                raise ContractError("non-finite output logits during prompt execution")
+        assert logits is not None
+
+        generated: list[int] = []
+        stopped = False
+        for step in range(limit):
+            token = int(mx.argmax(logits[0, -1], axis=-1).item())
+            generated.append(token)
+            if on_token is not None:
+                on_token(token, generated)
+            if token in self.config.eos_token_ids:
+                stopped = True
+                break
+            if step + 1 < limit:
+                logits = self.model(mx.array([[token]], dtype=mx.int32), cache)
+                mx.eval(logits)
+                if not bool(mx.all(mx.isfinite(logits)).item()):
+                    raise ContractError("non-finite output logits during generation")
+        elapsed = time.perf_counter() - started
+        caches = tuple(layer.experts.stats() for layer in self.model.expert_layers())
+        return generated, GenerationStats(
+            prompt_tokens=len(prompt_ids),
+            generated_tokens=len(generated),
+            elapsed_seconds=elapsed,
+            stopped_on_eos=stopped,
+            reader=self.expert_reader.stats(),
+            expert_caches=caches,
+        )

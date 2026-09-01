@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "livglm"
+version = "0.1.0"
+description = "Native MLX ExpertSSD runtime and checkpoint tools for GLM-5.3-Flash"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "mlx>=0.32,<0.33",
+  "jinja2>=3.1.6,<4",
+  "numpy==2.5.1",
+  "safetensors>=0.8,<0.9",
+  "transformers==5.14.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9,<10"]
+
+[project.scripts]
+livglm = "glm53flash.chat_cli:entrypoint"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
