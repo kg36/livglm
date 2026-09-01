@@ -268,23 +268,28 @@ class TargetRuntime:
         memory_gib: float | None = None,
         physical_bytes: int | None = None,
         resident_mxfp8: bool = True,
+        resident_mxfp4: bool = False,
     ) -> PreflightResult:
         contract = ModelContract.from_model_dir(model_dir)
         contract.validate_supported_profile()
         config = GLMTextConfig.from_model_dict(contract.config)
         resident = build_resident_source_plan(contract)
         experts = build_native_expert_source_plan(contract, config)
+        resident_format = (
+            "mxfp4" if resident_mxfp4 else "mxfp8" if resident_mxfp8 else "bf16"
+        )
+        resident_runtime_bytes = {
+            "mxfp4": resident.mxfp4_runtime_bytes,
+            "mxfp8": resident.mxfp8_runtime_bytes,
+            "bf16": resident.destination_bytes,
+        }[resident_format]
         profile = resolve_runtime_profile(
             memory_gib,
-            resident_bytes=(
-                resident.mxfp8_runtime_bytes
-                if resident_mxfp8
-                else resident.destination_bytes
-            ),
+            resident_bytes=resident_runtime_bytes,
             resident_load_bytes=resident.destination_bytes,
-            resident_format="mxfp8" if resident_mxfp8 else "bf16",
+            resident_format=resident_format,
             resident_linear_count=(
-                resident.mxfp8_linear_count if resident_mxfp8 else 0
+                resident.mxfp8_linear_count if resident_format != "bf16" else 0
             ),
             physical_bytes=physical_bytes,
         )
@@ -297,11 +302,13 @@ class TargetRuntime:
         *,
         memory_gib: float | None = None,
         resident_mxfp8: bool = True,
+        resident_mxfp4: bool = False,
     ) -> "TargetRuntime":
         preflight = cls.preflight(
             model_dir,
             memory_gib=memory_gib,
             resident_mxfp8=resident_mxfp8,
+            resident_mxfp4=resident_mxfp4,
         )
         contract = ModelContract.from_model_dir(preflight.model_dir)
         config = GLMTextConfig.from_model_dict(contract.config)
@@ -336,19 +343,23 @@ class TargetRuntime:
                 expert_factory=make_experts,
             )
             resident_stats = NativeResidentReader(preflight.resident_plan).load_into(model)
-            if preflight.profile.resident_format == "mxfp8":
-                quantization = model.quantize_resident_linears_mxfp8()
+            if preflight.profile.resident_format in {"mxfp4", "mxfp8"}:
+                bits = 4 if preflight.profile.resident_format == "mxfp4" else 8
+                quantization = model.quantize_resident_linears_mxfp(bits)
                 expected = {
-                    "format": "mxfp8",
+                    "format": preflight.profile.resident_format,
                     "linear_count": preflight.resident_plan.mxfp8_linear_count,
                     "source_bytes": preflight.resident_plan.mxfp8_source_linear_bytes,
                     "destination_bytes": (
-                        preflight.resident_plan.mxfp8_destination_linear_bytes
+                        preflight.resident_plan.mxfp4_destination_linear_bytes
+                        if bits == 4
+                        else preflight.resident_plan.mxfp8_destination_linear_bytes
                     ),
                 }
                 if quantization != expected:
                     raise ContractError(
-                        f"resident MXFP8 conversion inventory changed: "
+                        f"resident {preflight.profile.resident_format.upper()} "
+                        f"conversion inventory changed: "
                         f"{quantization} != {expected}"
                     )
             else:

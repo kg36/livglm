@@ -216,7 +216,10 @@ class GLMForCausalLM(nn.Module):
         values = [layer.mlp for layer in self.language_model.layers]
         return tuple(value for value in values if isinstance(value, ExpertSSDMoE))
 
-    def quantize_resident_linears_mxfp8(self) -> dict[str, int | str]:
+    def quantize_resident_linears_mxfp(self, bits: int) -> dict[str, int | str]:
+        mode = f"mxfp{bits}"
+        if bits not in {4, 8}:
+            raise ContractError(f"unsupported resident quantization: {mode}")
         modules: list[DeferredLinear] = []
         seen: set[int] = set()
         for _, module in tree_flatten(
@@ -234,15 +237,21 @@ class GLMForCausalLM(nn.Module):
         source_bytes = 0
         destination_bytes = 0
         for index, module in enumerate(modules):
-            source, destination = module.quantize_to_mxfp8()
+            source, destination = module.quantize_to_mxfp(bits)
             source_bytes += source
             destination_bytes += destination
             if index % 32 == 31:
                 mx.clear_cache()
         mx.clear_cache()
         return {
-            "format": "mxfp8",
+            "format": mode,
             "linear_count": len(modules),
             "source_bytes": source_bytes,
             "destination_bytes": destination_bytes,
         }
+
+    def quantize_resident_linears_mxfp8(self) -> dict[str, int | str]:
+        return self.quantize_resident_linears_mxfp(8)
+
+    def quantize_resident_linears_mxfp4(self) -> dict[str, int | str]:
+        return self.quantize_resident_linears_mxfp(4)

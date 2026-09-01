@@ -53,6 +53,20 @@ def test_30_gib_mxfp8_runtime_has_33_slots_under_the_same_hard_budget():
     assert profile.budget_headroom_gib == pytest.approx(0.447374113)
 
 
+def test_30_gib_mxfp4_runtime_has_41_slots_under_the_same_hard_budget():
+    profile = resolve_runtime_profile(
+        30,
+        resident_bytes=5_923_027_192,
+        resident_load_bytes=17_842_600_184,
+        resident_format="mxfp4",
+        resident_linear_count=497,
+        physical_bytes=256 * 2**30,
+    )
+    assert profile.resident_format == "mxfp4"
+    assert profile.expert_capacity == 41
+    assert profile.planned_gib <= 30
+
+
 def test_profile_rejects_less_than_one_topk_bank():
     with pytest.raises(ContractError, match="below routed top-k 8"):
         resolve_runtime_profile(20, physical_bytes=256 * 2**30)

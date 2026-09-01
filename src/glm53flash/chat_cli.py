@@ -34,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="retain the BF16 resident correctness oracle instead of startup MXFP8",
     )
+    parser.add_argument(
+        "--resident-mxfp4",
+        action="store_true",
+        help="use startup MXFP4 resident weights to leave more memory for ExpertSSD",
+    )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_DIR, metavar="PATH", help=argparse.SUPPRESS)
     parser.add_argument("--preflight", action="store_true", help="validate metadata and print the runtime plan only")
     parser.add_argument(
@@ -160,11 +165,14 @@ def _one_turn(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.resident_bf16 and args.resident_mxfp4:
+        parser.error("--resident-bf16 cannot be combined with --resident-mxfp4")
     if args.preflight:
         result = TargetRuntime.preflight(
             args.model,
             memory_gib=args.memory,
             resident_mxfp8=not args.resident_bf16,
+            resident_mxfp4=args.resident_mxfp4,
         )
         print(json.dumps(result.as_dict(), indent=2))
         return 0
@@ -181,9 +189,16 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("--trace-decode-start/steps require --trace")
 
+    resident_label = (
+        "BF16 oracle"
+        if args.resident_bf16
+        else "startup MXFP4"
+        if args.resident_mxfp4
+        else "startup MXFP8"
+    )
     print(
         "Loading GLM-5.3-Flash resident weights; routed experts stay on SSD "
-        f"({'BF16 oracle' if args.resident_bf16 else 'startup MXFP8'} resident, "
+        f"({resident_label} resident, "
         "native MXFP4 ExpertSSD, no ScaleX)…",
         file=sys.stderr,
         flush=True,
@@ -192,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         args.model,
         memory_gib=args.memory,
         resident_mxfp8=not args.resident_bf16,
+        resident_mxfp4=args.resident_mxfp4,
     )
     print(
         f"Ready: {runtime.profile.resident_gib:.2f} GiB "

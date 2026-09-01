@@ -156,6 +156,29 @@ Perfect overlap would put the arithmetic floor near
 `max(104 ms, 143 ms) + 17 ms = 160 ms`, about 6.2 token/s. This is an upper
 bound, not a forecast, but it brackets the value of the next phase.
 
+## Follow-up implementation verdict
+
+The proposed current-layer staging was implemented and measured in several
+forms. Two-range gate/up-then-down staging fell to 2.377 token/s, its Metal
+event version to 2.280 token/s, and a less fragmented batched version to 3.450
+token/s. Resident-hit overlap was neutral at 3.534 token/s versus a 3.548
+control. Completion-order and per-expert Metal-stream variants produced only
+noise-sized changes. These paths were removed rather than made default.
+
+The trace's global overlap upper bound is therefore not directly attainable by
+local scheduling: the route depends on upstream GPU work, and the next layer
+depends on every current expert contribution. The retained local improvement
+is the opt-in MXFP4 resident mode documented in
+[`mxfp4-expert-cache.md`](mxfp4-expert-cache.md), which uses the saved memory
+for eight additional exact ExpertSSD slots/layer and measured about 10% faster.
+
+Simple causal route-history read-ahead was also rejected: top-4 advice covered
+only 0.7% of actual next-token misses. The checkpoint's unused MTP layer 45 is
+the credible source for a future predictive-prefetch study, subject to
+held-out precision and bandwidth gates. A cheaper MTP-input-anchor pilot
+recalled 10.2% of misses at only 5.9% advice precision, so that approximation
+was rejected as well.
+
 ## Capture hygiene
 
 Raw Instruments `.trace` bundles embed the attached process environment.
