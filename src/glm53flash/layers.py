@@ -37,15 +37,16 @@ class DeferredLinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         weight = require_weight(self.weight, "linear.weight")
-        if self.quantization_mode == "mxfp8":
+        if self.quantization_mode in {"mxfp4", "mxfp8"}:
+            bits = 4 if self.quantization_mode == "mxfp4" else 8
             result = mx.quantized_matmul(
                 x,
                 weight,
                 require_weight(self.scales, "linear.scales"),
                 transpose=True,
                 group_size=32,
-                bits=8,
-                mode="mxfp8",
+                bits=bits,
+                mode=self.quantization_mode,
             )
         else:
             result = x @ weight.T
@@ -53,28 +54,40 @@ class DeferredLinear(nn.Module):
             result = result + require_weight(self.bias, "linear.bias")
         return result
 
-    def quantize_to_mxfp8(self) -> tuple[int, int]:
+    def quantize_to_mxfp(self, bits: int) -> tuple[int, int]:
+        mode = f"mxfp{bits}"
+        if bits not in {4, 8}:
+            raise ContractError(f"unsupported resident quantization: {mode}")
         if not self.quantize_resident:
-            raise ContractError("this deferred linear is excluded from resident MXFP8")
+            raise ContractError(
+                f"this deferred linear is excluded from resident {mode.upper()}"
+            )
         if self.quantization_mode is not None:
             raise ContractError("deferred linear was already quantized")
         weight = require_weight(self.weight, "linear.weight")
         if weight.ndim != 2 or weight.shape[-1] % 32:
             raise ContractError(
-                f"resident MXFP8 requires a group-32 matrix: {tuple(weight.shape)}"
+                f"resident {mode.upper()} requires a group-32 matrix: "
+                f"{tuple(weight.shape)}"
             )
         source_bytes = weight.nbytes
         packed, scales = mx.quantize(
             weight,
             group_size=32,
-            bits=8,
-            mode="mxfp8",
+            bits=bits,
+            mode=mode,
         )
         mx.eval(packed, scales)
         self.weight = packed
         self.scales = scales
-        self.quantization_mode = "mxfp8"
+        self.quantization_mode = mode
         return source_bytes, packed.nbytes + scales.nbytes
+
+    def quantize_to_mxfp8(self) -> tuple[int, int]:
+        return self.quantize_to_mxfp(8)
+
+    def quantize_to_mxfp4(self) -> tuple[int, int]:
+        return self.quantize_to_mxfp(4)
 
 
 class DeferredEmbedding(nn.Module):

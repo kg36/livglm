@@ -1,6 +1,6 @@
 import pytest
 
-from glm53flash.chat_cli import build_parser
+from glm53flash.chat_cli import build_parser, main
 from glm53flash.runtime import DEFAULT_MODEL_DIR, TargetRuntime
 
 
@@ -17,12 +17,37 @@ def test_cli_keeps_basic_deepseek_user_surface():
     oracle = build_parser().parse_args(["--resident-bf16", "hello"])
     assert oracle.resident_bf16
 
+    compact = build_parser().parse_args(["--resident-mxfp4", "hello"])
+    assert compact.resident_mxfp4
+
+    traced = build_parser().parse_args(
+        [
+            "--trace",
+            "artifacts/decode.json",
+            "--trace-decode-start",
+            "2",
+            "--trace-decode-steps",
+            "24",
+            "hello",
+        ]
+    )
+    assert traced.trace.name == "decode.json"
+    assert traced.trace_decode_start == 2
+    assert traced.trace_decode_steps == 24
+
 
 def test_cli_help_does_not_load_model(capsys):
     with pytest.raises(SystemExit) as stopped:
         build_parser().parse_args(["--help"])
     assert stopped.value.code == 0
     assert "ExpertSSD" in capsys.readouterr().out
+
+
+def test_cli_rejects_conflicting_resident_formats(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        main(["--resident-bf16", "--resident-mxfp4", "--preflight"])
+    assert stopped.value.code == 2
+    assert "cannot be combined" in capsys.readouterr().err
 
 
 @pytest.mark.skipif(not (DEFAULT_MODEL_DIR / "chat_template.jinja").is_file(), reason="local tokenizer absent")

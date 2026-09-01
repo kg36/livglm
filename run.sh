@@ -15,5 +15,12 @@ if [[ ! -d "$native_overlay" ]]; then
   exit 2
 fi
 
+for argument in "$@"; do
+  if [[ "$argument" == "--trace" || "$argument" == --trace=* ]]; then
+    export MLX_PROFILE_METAL_COUNTERS=1
+    break
+  fi
+done
+
 export PYTHONPATH="$native_overlay:$project_root/src${PYTHONPATH:+:$PYTHONPATH}"
 exec "$python_bin" -m glm53flash.chat_cli "$@"

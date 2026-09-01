@@ -111,11 +111,33 @@ class ResidentSourcePlan:
         return total
 
     @property
+    def mxfp4_destination_linear_bytes(self) -> int:
+        total = 0
+        for tensor in self.tensors:
+            if not self._mxfp8_linear(tensor):
+                continue
+            elements = tensor.destination_shape[0] * tensor.destination_shape[1]
+            if elements % MXFP8_GROUP_SIZE:
+                raise ContractError(
+                    f"resident MXFP4 group geometry changed: {tensor.destination_name}"
+                )
+            total += elements // 2 + elements // MXFP8_GROUP_SIZE
+        return total
+
+    @property
     def mxfp8_runtime_bytes(self) -> int:
         return (
             self.destination_bytes
             - self.mxfp8_source_linear_bytes
             + self.mxfp8_destination_linear_bytes
+        )
+
+    @property
+    def mxfp4_runtime_bytes(self) -> int:
+        return (
+            self.destination_bytes
+            - self.mxfp8_source_linear_bytes
+            + self.mxfp4_destination_linear_bytes
         )
 
     @property
@@ -140,6 +162,7 @@ class ResidentSourcePlan:
             "source_bytes": self.source_bytes,
             "destination_bytes": self.destination_bytes,
             "mxfp8_runtime_bytes": self.mxfp8_runtime_bytes,
+            "mxfp4_runtime_bytes": self.mxfp4_runtime_bytes,
             "mxfp8_linear_count": self.mxfp8_linear_count,
             "shard_count": self.shard_count,
             "transforms": {
@@ -243,5 +266,14 @@ def build_resident_source_plan(contract: ModelContract) -> ResidentSourcePlan:
         if actual_mxfp8 != expected_mxfp8:
             raise ContractError(
                 f"resident MXFP8 budget changed: {actual_mxfp8} != {expected_mxfp8}"
+            )
+        expected_mxfp4 = (4_311_334_912, 5_923_027_192)
+        actual_mxfp4 = (
+            plan.mxfp4_destination_linear_bytes,
+            plan.mxfp4_runtime_bytes,
+        )
+        if actual_mxfp4 != expected_mxfp4:
+            raise ContractError(
+                f"resident MXFP4 budget changed: {actual_mxfp4} != {expected_mxfp4}"
             )
     return plan
