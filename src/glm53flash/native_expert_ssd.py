@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -17,6 +18,7 @@ from .contract import ContractError
 from .expert_reader import ReaderStats
 from .expert_source import NativeExpertSourcePlan
 from .expert_ssd import ExpertCacheStats, limited_swiglu
+from .trace import DecodeTrace, active_trace
 
 
 _DTYPES = {
@@ -61,6 +63,23 @@ class NativeRoutePlan:
     hits: int
     misses: int
     evictions: int
+
+
+def _run_traced_load(
+    trace: DecodeTrace,
+    flow_id: int,
+    source: "NativeExpertLayerSource",
+    expert: int,
+    slot: int,
+    destinations: tuple[mx.array, ...],
+    args: dict[str, int | str],
+) -> float:
+    trace.flow("t", flow_id, args=args)
+    try:
+        with trace.span("SSD_read", category="ssd_worker", args=args, force=True):
+            return source.load_into(expert, slot, destinations)
+    finally:
+        trace.flow("f", flow_id, args=args)
 
 
 class NativeExpertPool:
@@ -114,6 +133,30 @@ class NativeExpertPool:
     ) -> Future[float]:
         if self._closed:
             raise RuntimeError("native ExpertSSD pool is closed")
+        trace = active_trace()
+        if trace is not None:
+            flow_id = trace.new_flow()
+            args: dict[str, int | str] = {
+                "decode_index": int(trace.current_decode_index or 0),
+                "layer": source.layer,
+                "expert": int(expert),
+                "destination_slot": int(slot),
+                "read_ranges": source.read_range_counts[int(expert)],
+                "payload_bytes": source.payload_bytes[int(expert)],
+                "shard": source.shard_name,
+                "backend": "mlx-io-glm/direct-to-slot",
+            }
+            trace.flow("s", flow_id, args=args)
+            return self._executor.submit(
+                _run_traced_load,
+                trace,
+                flow_id,
+                source,
+                expert,
+                slot,
+                destinations,
+                args,
+            )
         return self._executor.submit(source.load_into, expert, slot, destinations)
 
     def record_loads(
@@ -339,41 +382,104 @@ class NativeExpertSSD(nn.Module):
             raise RuntimeError("native ExpertSSD slots were not activated")
         if indices.ndim < 1 or indices.shape[-1] < 1:
             raise ContractError("routed expert indices must have a top-k dimension")
+        trace = active_trace()
+        route_args = {
+            "decode_index": trace.current_decode_index if trace is not None else None,
+            "layer": self.layer,
+            "semantics": (
+                "host waits for routed indices and all upstream Metal work; "
+                "actual kernels are in the paired Metal System Trace"
+            ),
+        }
         route_started = time.perf_counter()
-        raw = mx._expert_ssd_route_cache_plan(self._route_cache_state, indices)
+        if trace is None:
+            raw = mx._expert_ssd_route_cache_plan(self._route_cache_state, indices)
+        else:
+            with trace.span(
+                "materialize_route",
+                category="gpu_sync",
+                args=route_args,
+            ) as event_args:
+                raw = mx._expert_ssd_route_cache_plan(self._route_cache_state, indices)
+                event_args["routed_positions"] = len(raw["routed"])
+                event_args["unique_experts"] = len(raw["unique"])
         route_seconds = time.perf_counter() - route_started
-        unique = tuple(int(value) for value in raw["unique"])
-        self.last_expert_ids = tuple(int(value) for value in raw["routed"])
-        if len(unique) > self.capacity:
-            raise ContractError(
-                f"layer {self.layer} routed {len(unique)} unique experts, "
-                f"exceeding native ExpertSSD capacity {self.capacity}"
+        slot_started = time.perf_counter()
+        with (
+            trace.span(
+                "slot_plan",
+                category="cache",
+                args={
+                    "decode_index": trace.current_decode_index,
+                    "layer": self.layer,
+                    "capacity": self.capacity,
+                },
             )
-        invalid = [
-            expert
-            for expert in unique
-            if not 0 <= expert < self.pool.plan.experts_per_layer
-        ]
-        if invalid:
-            raise ContractError(f"routed expert ids are out of range: {invalid}")
+            if trace is not None
+            else nullcontext({})
+        ) as slot_args:
+            unique = tuple(int(value) for value in raw["unique"])
+            self.last_expert_ids = tuple(int(value) for value in raw["routed"])
+            if len(unique) > self.capacity:
+                raise ContractError(
+                    f"layer {self.layer} routed {len(unique)} unique experts, "
+                    f"exceeding native ExpertSSD capacity {self.capacity}"
+                )
+            invalid = [
+                expert
+                for expert in unique
+                if not 0 <= expert < self.pool.plan.experts_per_layer
+            ]
+            if invalid:
+                raise ContractError(f"routed expert ids are out of range: {invalid}")
 
-        proposed = self._expert_to_slot.copy()
-        for expert in raw["evicted"]:
-            proposed.pop(int(expert), None)
-        gate_rows = tuple(int(value) for value in raw["gate_up_rows"])
-        for expert, slot in zip(unique, gate_rows, strict=True):
-            proposed.pop(expert, None)
-            proposed[expert] = slot
-        miss_experts = tuple(int(value) for value in raw["missing"])
-        miss_slots = tuple(int(value) for value in raw["missing_gate_up_rows"])
+            proposed = self._expert_to_slot.copy()
+            for expert in raw["evicted"]:
+                proposed.pop(int(expert), None)
+            gate_rows = tuple(int(value) for value in raw["gate_up_rows"])
+            for expert, slot in zip(unique, gate_rows, strict=True):
+                proposed.pop(expert, None)
+                proposed[expert] = slot
+            miss_experts = tuple(int(value) for value in raw["missing"])
+            miss_slots = tuple(int(value) for value in raw["missing_gate_up_rows"])
+            compact_slots = mx.array(gate_rows, dtype=mx.uint32)
+            remapped = mx.take(compact_slots, raw["compact"])
+            slot_args.update(
+                {
+                    "requested_experts": unique,
+                    "missing_experts": miss_experts,
+                    "hit_count": int(raw["hits"]),
+                    "missing_count": int(raw["misses"]),
+                    "eviction_count": len(raw["evicted"]),
+                }
+            )
+        slot_seconds = time.perf_counter() - slot_started
 
-        futures = tuple(
-            self.pool.submit(self.source, expert, slot, self.slots)
-            for expert, slot in zip(miss_experts, miss_slots, strict=True)
-        )
-        compact_slots = mx.array(gate_rows, dtype=mx.uint32)
-        remapped = mx.take(compact_slots, raw["compact"])
+        if trace is None:
+            futures = tuple(
+                self.pool.submit(self.source, expert, slot, self.slots)
+                for expert, slot in zip(miss_experts, miss_slots, strict=True)
+            )
+        else:
+            with trace.span(
+                "issue_reads",
+                category="ssd_issue",
+                args={
+                    "decode_index": trace.current_decode_index,
+                    "layer": self.layer,
+                    "experts": miss_experts,
+                    "read_count": len(miss_experts),
+                    "payload_bytes": sum(
+                        self.source.payload_bytes[expert] for expert in miss_experts
+                    ),
+                },
+            ):
+                futures = tuple(
+                    self.pool.submit(self.source, expert, slot, self.slots)
+                    for expert, slot in zip(miss_experts, miss_slots, strict=True)
+                )
         self._route_sync_seconds += route_seconds
+        self._slot_plan_seconds += slot_seconds
         return NativeRoutePlan(
             remapped=remapped,
             proposed_mapping=proposed,
@@ -386,7 +492,25 @@ class NativeExpertSSD(nn.Module):
 
     def _finish_refill(self, plan: NativeRoutePlan) -> None:
         wait_started = time.perf_counter()
-        worker_seconds = tuple(future.result() for future in plan.futures)
+        trace = active_trace()
+        if trace is None:
+            worker_seconds = tuple(future.result() for future in plan.futures)
+        else:
+            with trace.span(
+                "join_reads",
+                category="ssd_join",
+                args={
+                    "decode_index": trace.current_decode_index,
+                    "layer": self.layer,
+                    "experts": plan.miss_experts,
+                    "read_count": len(plan.futures),
+                    "payload_bytes": sum(
+                        self.source.payload_bytes[expert]
+                        for expert in plan.miss_experts
+                    ),
+                },
+            ):
+                worker_seconds = tuple(future.result() for future in plan.futures)
         wait_seconds = time.perf_counter() - wait_started
         self.pool.record_loads(
             self.source,
@@ -412,47 +536,68 @@ class NativeExpertSSD(nn.Module):
             and x.shape[-1] % 512 == 0
             and by_name["up_proj.weight"].shape[-2] % 8 == 0
         )
-        if production_native_qmv:
-            routes = plan.remapped.reshape(-1).astype(mx.uint32)
-            up, gate = mx._expert_ssd_mxfp4_pair_qmv(
-                x.reshape(1, x.shape[-1]),
-                by_name["up_proj.weight"],
-                by_name["up_proj.scales"],
-                by_name["gate_proj.weight"],
-                by_name["gate_proj.scales"],
-                routes,
+        trace = active_trace()
+        with (
+            trace.span(
+                "routed_expert_graph_construct",
+                category="mlx_submit",
+                args={
+                    "decode_index": trace.current_decode_index,
+                    "layer": self.layer,
+                    "routes": int(plan.remapped.size),
+                    "misses": plan.misses,
+                    "primitive": (
+                        "native_mxfp4_qmv" if production_native_qmv else "gather_qmm"
+                    ),
+                    "semantics": (
+                        "Python/native graph construction, not GPU kernel time"
+                    ),
+                },
             )
+            if trace is not None
+            else nullcontext({})
+        ):
+            if production_native_qmv:
+                routes = plan.remapped.reshape(-1).astype(mx.uint32)
+                up, gate = mx._expert_ssd_mxfp4_pair_qmv(
+                    x.reshape(1, x.shape[-1]),
+                    by_name["up_proj.weight"],
+                    by_name["up_proj.scales"],
+                    by_name["gate_proj.weight"],
+                    by_name["gate_proj.scales"],
+                    routes,
+                )
+                activated = limited_swiglu(gate, up, self.swiglu_limit)
+                output = mx._expert_ssd_mxfp4_masked_qmv(
+                    activated,
+                    by_name["down_proj.weight"],
+                    by_name["down_proj.scales"],
+                    routes,
+                )
+                return output.reshape(
+                    *plan.remapped.shape,
+                    1,
+                    x.shape[-1],
+                ).squeeze(-2)
+
+            expanded = mx.expand_dims(x, (-2, -3))
+
+            def qmm(value: mx.array, projection: str) -> mx.array:
+                return mx.gather_qmm(
+                    value,
+                    by_name[f"{projection}.weight"],
+                    by_name[f"{projection}.scales"],
+                    rhs_indices=plan.remapped,
+                    transpose=True,
+                    group_size=32,
+                    bits=4,
+                    mode="mxfp4",
+                )
+
+            gate = qmm(expanded, "gate_proj")
+            up = qmm(expanded, "up_proj")
             activated = limited_swiglu(gate, up, self.swiglu_limit)
-            output = mx._expert_ssd_mxfp4_masked_qmv(
-                activated,
-                by_name["down_proj.weight"],
-                by_name["down_proj.scales"],
-                routes,
-            )
-            return output.reshape(
-                *plan.remapped.shape,
-                1,
-                x.shape[-1],
-            ).squeeze(-2)
-
-        expanded = mx.expand_dims(x, (-2, -3))
-
-        def qmm(value: mx.array, projection: str) -> mx.array:
-            return mx.gather_qmm(
-                value,
-                by_name[f"{projection}.weight"],
-                by_name[f"{projection}.scales"],
-                rhs_indices=plan.remapped,
-                transpose=True,
-                group_size=32,
-                bits=4,
-                mode="mxfp4",
-            )
-
-        gate = qmm(expanded, "gate_proj")
-        up = qmm(expanded, "up_proj")
-        activated = limited_swiglu(gate, up, self.swiglu_limit)
-        return qmm(activated, "down_proj").squeeze(-2)
+            return qmm(activated, "down_proj").squeeze(-2)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         return self.finish(x, self.prepare(indices))

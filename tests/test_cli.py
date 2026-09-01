@@ -17,6 +17,21 @@ def test_cli_keeps_basic_deepseek_user_surface():
     oracle = build_parser().parse_args(["--resident-bf16", "hello"])
     assert oracle.resident_bf16
 
+    traced = build_parser().parse_args(
+        [
+            "--trace",
+            "artifacts/decode.json",
+            "--trace-decode-start",
+            "2",
+            "--trace-decode-steps",
+            "24",
+            "hello",
+        ]
+    )
+    assert traced.trace.name == "decode.json"
+    assert traced.trace_decode_start == 2
+    assert traced.trace_decode_steps == 24
+
 
 def test_cli_help_does_not_load_model(capsys):
     with pytest.raises(SystemExit) as stopped:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import math
 import os
@@ -20,6 +21,7 @@ from .model_config import GLMTextConfig
 from .native_expert_ssd import NativeExpertPool, NativeExpertSSD
 from .resident_plan import ResidentSourcePlan, build_resident_source_plan
 from .resident_reader import NativeResidentReader, ResidentReaderStats
+from .trace import DecodeTrace
 
 
 DEFAULT_MODEL_DIR = Path("/Users/kumargaurav/Documents/livglm/GLM53Flash")
@@ -30,6 +32,40 @@ CONTEXT_LIMIT = 128
 EXPERT_SLOT_BYTES = 13_369_344
 MOE_LAYER_COUNT = 42
 MINIMUM_EXPERT_CAPACITY = 8
+
+
+def _metal_profile_counts() -> dict[str, int]:
+    profile = getattr(mx.metal, "_profile_counters", None)
+    if profile is None:
+        return {}
+    return {
+        str(name): int(value)
+        for name, value in profile().items()
+        if name != "enabled"
+    }
+
+
+def _wait_for_external_profiler(ready: Path, go: Path) -> None:
+    """Pause after prefill so Instruments can attach to decode only."""
+
+    ready = ready.expanduser().resolve()
+    go = go.expanduser().resolve()
+    if ready.exists():
+        raise FileExistsError(f"external-profile ready path already exists: {ready}")
+    if go.exists():
+        raise FileExistsError(f"external-profile go path already exists: {go}")
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text(
+        f'{{"pid":{os.getpid()},"monotonic_ns":{time.perf_counter_ns()}}}\n',
+        encoding="utf-8",
+    )
+    deadline = time.monotonic() + 120.0
+    while not go.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"external profiler did not create go file within 120 seconds: {go}"
+            )
+        time.sleep(0.01)
 
 
 @dataclass(frozen=True)
@@ -389,6 +425,9 @@ class TargetRuntime:
         *,
         max_new_tokens: int | None = None,
         on_token: Callable[[int, list[int]], None] | None = None,
+        trace: DecodeTrace | None = None,
+        external_profile_ready: Path | None = None,
+        external_profile_go: Path | None = None,
     ) -> tuple[list[int], GenerationStats]:
         if not prompt_ids:
             raise ContractError("prompt tokenization produced no tokens")
@@ -400,6 +439,10 @@ class TargetRuntime:
         limit = remaining if max_new_tokens is None else min(int(max_new_tokens), remaining)
         if limit < 1:
             raise ContractError("--max-tokens must be positive")
+        if (external_profile_ready is None) != (external_profile_go is None):
+            raise ValueError(
+                "external_profile_ready and external_profile_go must be paired"
+            )
 
         cache = self.model.empty_cache()
         logits = None
@@ -417,6 +460,11 @@ class TargetRuntime:
         caches_after_prefill = tuple(
             layer.experts.stats() for layer in self.model.expert_layers()
         )
+        if external_profile_ready is not None and external_profile_go is not None:
+            _wait_for_external_profiler(
+                external_profile_ready,
+                external_profile_go,
+            )
 
         generated: list[int] = []
         stopped = False
@@ -431,11 +479,94 @@ class TargetRuntime:
                 stopped = True
                 break
             if step + 1 < limit:
-                logits = self.model(mx.array([[token]], dtype=mx.int32), cache)
-                mx.eval(logits)
-                decode_forwards += 1
-                if not bool(mx.all(mx.isfinite(logits)).item()):
-                    raise ContractError("non-finite output logits during generation")
+                trace_context = (
+                    trace.decode_step(step, token_id=token)
+                    if trace is not None
+                    else nullcontext(False)
+                )
+                with trace_context as tracing:
+                    if tracing:
+                        step_reader_before = self.expert_reader.stats()
+                        step_caches_before = tuple(
+                            layer.experts.stats()
+                            for layer in self.model.expert_layers()
+                        )
+                        metal_before = _metal_profile_counts()
+                    forward_context = (
+                        trace.span(
+                            "model_forward",
+                            category="python",
+                            args={
+                                "decode_index": step,
+                                "semantics": (
+                                    "Python forward including route GPU waits, SSD "
+                                    "joins, and lazy MLX graph construction"
+                                ),
+                            },
+                        )
+                        if tracing and trace is not None
+                        else nullcontext({})
+                    )
+                    with forward_context:
+                        logits = self.model(
+                            mx.array([[token]], dtype=mx.int32),
+                            cache,
+                        )
+                    eval_context = (
+                        trace.span(
+                            "final_logits_eval_wait",
+                            category="gpu_sync",
+                            args={
+                                "decode_index": step,
+                                "semantics": (
+                                    "CPU wait for outstanding MLX GPU work; actual "
+                                    "kernel execution is in the paired Metal trace"
+                                ),
+                            },
+                        )
+                        if tracing and trace is not None
+                        else nullcontext({})
+                    )
+                    with eval_context:
+                        mx.eval(logits)
+                    decode_forwards += 1
+                    if not bool(mx.all(mx.isfinite(logits)).item()):
+                        raise ContractError("non-finite output logits during generation")
+                    if tracing and trace is not None:
+                        step_reader_after = self.expert_reader.stats()
+                        step_caches_after = tuple(
+                            layer.experts.stats()
+                            for layer in self.model.expert_layers()
+                        )
+                        reader_delta = _reader_delta(
+                            step_reader_after,
+                            step_reader_before,
+                        )
+                        cache_delta = _cache_delta(
+                            step_caches_after,
+                            step_caches_before,
+                        )
+                        metal_after = _metal_profile_counts()
+                        values: dict[str, int | float] = {
+                            "expert_loads": reader_delta.expert_loads,
+                            "logical_read_requests": reader_delta.logical_reads,
+                            "logical_read_bytes": reader_delta.read_bytes,
+                            "expert_cache_hits": sum(item.hits for item in cache_delta),
+                            "expert_misses": sum(item.misses for item in cache_delta),
+                            "expert_evictions": sum(
+                                item.evictions for item in cache_delta
+                            ),
+                            "active_memory_bytes": int(mx.get_active_memory()),
+                            "peak_memory_bytes": int(mx.get_peak_memory()),
+                        }
+                        values.update(
+                            {
+                                f"metal_{name}": metal_after.get(name, 0)
+                                - metal_before.get(name, 0)
+                                for name in set(metal_before) | set(metal_after)
+                            }
+                        )
+                        trace.counter("decode_step_metrics", values)
         decode_seconds = time.perf_counter() - decode_started
         elapsed = time.perf_counter() - started
         reader_end = self.expert_reader.stats()

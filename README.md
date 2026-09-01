@@ -66,6 +66,8 @@ The command UX follows the DeepSeek project:
 ./run.sh --chat --memory 24
 ./run.sh --thinking --max-tokens 8 "Explain mHC briefly."
 ./run.sh --resident-bf16 --memory 30 --max-tokens 1 "Say hello."
+./run.sh --memory 30 --max-tokens 25 --trace artifacts/perfetto/decode.json \
+  --trace-decode-steps 24 "who are you"
 ```
 
 `--memory` is a hard total MLX runtime ceiling, not an expert-cache allowance.
@@ -86,4 +88,6 @@ See [`docs/v1-impl.md`](docs/v1-impl.md) for the original correctness plan,
 [`docs/v1-status.md`](docs/v1-status.md) for the first-token milestone, and
 [`docs/native-expertssd-status.md`](docs/native-expertssd-status.md) for the
 native I/O milestone. Current performance measurements are in
-[`docs/mxfp8-performance.md`](docs/mxfp8-performance.md).
+[`docs/mxfp8-performance.md`](docs/mxfp8-performance.md), and the first
+correlated Perfetto/Metal bottleneck analysis is in
+[`docs/perfetto-analysis.md`](docs/perfetto-analysis.md).

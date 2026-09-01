@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import sys
 
 from .contract import ContractError
 from .runtime import DEFAULT_MODEL_DIR, TargetRuntime
+from .trace import DecodeTrace
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +36,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_DIR, metavar="PATH", help=argparse.SUPPRESS)
     parser.add_argument("--preflight", action="store_true", help="validate metadata and print the runtime plan only")
+    parser.add_argument(
+        "--trace",
+        type=Path,
+        metavar="PATH",
+        help="write a Perfetto/Chrome JSON trace for selected decode forwards",
+    )
+    parser.add_argument("--trace-decode-start", type=int, default=0, metavar="N")
+    parser.add_argument("--trace-decode-steps", type=int, default=20, metavar="N")
+    parser.add_argument(
+        "--external-profile-ready",
+        type=Path,
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--external-profile-go",
+        type=Path,
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -111,12 +133,24 @@ def _streamer(tokenizer):
     return emit
 
 
-def _one_turn(runtime: TargetRuntime, messages: list[dict[str, str]], *, thinking: bool, maximum: int | None) -> str:
+def _one_turn(
+    runtime: TargetRuntime,
+    messages: list[dict[str, str]],
+    *,
+    thinking: bool,
+    maximum: int | None,
+    trace: DecodeTrace | None = None,
+    external_profile_ready: Path | None = None,
+    external_profile_go: Path | None = None,
+) -> str:
     prompt_ids = runtime.encode_messages(messages, thinking=thinking)
     generated, stats = runtime.generate(
         prompt_ids,
         max_new_tokens=maximum,
         on_token=_streamer(runtime.tokenizer),
+        trace=trace,
+        external_profile_ready=external_profile_ready,
+        external_profile_go=external_profile_go,
     )
     print(flush=True)
     _print_stats(stats)
@@ -136,8 +170,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.chat and args.prompt:
         parser.error("a prompt cannot be combined with --chat")
+    if args.chat and args.trace is not None:
+        parser.error("--trace currently supports one-shot generation only")
     if not args.chat and not args.prompt:
         parser.error("provide a prompt or use --chat")
+    if (args.external_profile_ready is None) != (args.external_profile_go is None):
+        parser.error("--external-profile-ready and --external-profile-go must be paired")
+    if args.trace is None and (
+        args.trace_decode_start != 0 or args.trace_decode_steps != 20
+    ):
+        parser.error("--trace-decode-start/steps require --trace")
 
     print(
         "Loading GLM-5.3-Flash resident weights; routed experts stay on SSD "
@@ -165,12 +207,37 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.chat:
             messages = [{"role": "user", "content": " ".join(args.prompt)}]
-            _one_turn(
-                runtime,
-                messages,
-                thinking=args.thinking,
-                maximum=args.max_tokens,
+            decode_trace = (
+                DecodeTrace(
+                    args.trace,
+                    decode_start=args.trace_decode_start,
+                    decode_steps=args.trace_decode_steps,
+                    metadata={
+                        "model_dir": str(runtime.model_dir),
+                        "resident_format": runtime.profile.resident_format,
+                        "memory_gib": runtime.profile.effective_gib,
+                        "expert_capacity": runtime.profile.expert_capacity,
+                        "paired_gpu_trace": "Instruments Metal System Trace",
+                    },
+                )
+                if args.trace is not None
+                else None
             )
+            with decode_trace if decode_trace is not None else nullcontext():
+                _one_turn(
+                    runtime,
+                    messages,
+                    thinking=args.thinking,
+                    maximum=args.max_tokens,
+                    trace=decode_trace,
+                    external_profile_ready=args.external_profile_ready,
+                    external_profile_go=args.external_profile_go,
+                )
+            if decode_trace is not None:
+                print(
+                    f"Perfetto trace: {decode_trace.path}",
+                    file=sys.stderr,
+                )
             return 0
 
         history: list[dict[str, str]] = []

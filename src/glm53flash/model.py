@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,6 +17,7 @@ from .layers import DeferredEmbedding, DeferredLinear, DenseMLP, RMSNorm
 from .mhc import HyperConnection, HyperHead, hyper_residual
 from .model_config import GLMTextConfig
 from .moe import ExpertSSDBackend, ExpertSSDMoE
+from .trace import DecodeTrace, active_trace
 
 
 ExpertFactory = Callable[[int], ExpertSSDBackend]
@@ -62,23 +64,76 @@ class GLMDecoderLayer(nn.Module):
         return self.self_attn.empty_cache()
 
     def __call__(self, hidden_states: mx.array, cache: LayerCache) -> mx.array:
-        residual = hidden_states
-        post, comb, collapsed = self.attn_hc(hidden_states)
-        collapsed = self.input_layernorm(collapsed)
-        if isinstance(self.self_attn, KDALinearAttention):
-            if not isinstance(cache, KDACache):
-                raise ContractError(f"layer {self.layer_idx} expected a KDA cache")
-            attended = self.self_attn(collapsed, cache)
-        else:
-            if not isinstance(cache, DSACache):
-                raise ContractError(f"layer {self.layer_idx} expected a DSA cache")
-            attended = self.self_attn(collapsed, cache)
-        hidden_states = hyper_residual(residual, attended, post, comb)
+        trace = active_trace()
+        if trace is None:
+            return self._call_impl(hidden_states, cache, trace=None)
+        with trace.span(
+            "transformer_layer",
+            category="model_structure",
+            args={
+                "decode_index": trace.current_decode_index,
+                "layer": self.layer_idx,
+                "attention_type": self.block_type,
+                "ffn_type": "moe" if isinstance(self.mlp, ExpertSSDMoE) else "dense",
+            },
+        ):
+            return self._call_impl(hidden_states, cache, trace=trace)
 
-        residual = hidden_states
-        post, comb, collapsed = self.ffn_hc(hidden_states)
-        fed_forward = self.mlp(self.post_attention_layernorm(collapsed))
-        return hyper_residual(residual, fed_forward, post, comb)
+    def _call_impl(
+        self,
+        hidden_states: mx.array,
+        cache: LayerCache,
+        *,
+        trace: DecodeTrace | None,
+    ) -> mx.array:
+        stage_args = {
+            "decode_index": trace.current_decode_index if trace is not None else None,
+            "layer": self.layer_idx,
+            "semantics": (
+                "MLX graph construction; exact GPU execution is in the paired "
+                "Metal System Trace"
+            ),
+        }
+        attention_context = (
+            trace.span(
+                "attention_graph_construct",
+                category="mlx_submit",
+                args={**stage_args, "attention_type": self.block_type},
+            )
+            if trace is not None
+            else nullcontext({})
+        )
+        with attention_context:
+            residual = hidden_states
+            post, comb, collapsed = self.attn_hc(hidden_states)
+            collapsed = self.input_layernorm(collapsed)
+            if isinstance(self.self_attn, KDALinearAttention):
+                if not isinstance(cache, KDACache):
+                    raise ContractError(f"layer {self.layer_idx} expected a KDA cache")
+                attended = self.self_attn(collapsed, cache)
+            else:
+                if not isinstance(cache, DSACache):
+                    raise ContractError(f"layer {self.layer_idx} expected a DSA cache")
+                attended = self.self_attn(collapsed, cache)
+            hidden_states = hyper_residual(residual, attended, post, comb)
+
+        ffn_context = (
+            trace.span(
+                "ffn_graph_construct",
+                category="mlx_submit",
+                args={
+                    **stage_args,
+                    "ffn_type": "moe" if isinstance(self.mlp, ExpertSSDMoE) else "dense",
+                },
+            )
+            if trace is not None
+            else nullcontext({})
+        )
+        with ffn_context:
+            residual = hidden_states
+            post, comb, collapsed = self.ffn_hc(hidden_states)
+            fed_forward = self.mlp(self.post_attention_layernorm(collapsed))
+            return hyper_residual(residual, fed_forward, post, comb)
 
 
 class GLMTextModel(nn.Module):

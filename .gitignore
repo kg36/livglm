@@ -12,3 +12,6 @@ __pycache__/
 /native/.dist-stage.*/
 /native/.testsite-stage.*/
 *.whl
+
+# Local profiler captures can be large and may contain machine metadata.
+/artifacts/perfetto/

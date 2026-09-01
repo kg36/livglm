@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,6 +13,7 @@ from .expert_ssd import ExpertSSD
 from .layers import DenseMLP, require_weight
 from .model_config import GLMTextConfig
 from .native_expert_ssd import NativeExpertSSD
+from .trace import DecodeTrace, active_trace
 
 
 class TopKRouter(nn.Module):
@@ -92,19 +94,95 @@ class ExpertSSDMoE(nn.Module):
         self.last_route: tuple[int, ...] = ()
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
+        trace = active_trace()
+        if trace is None:
+            return self._call_impl(hidden_states, trace=None)
+        before = self.experts.stats()
+        with trace.span(
+            "moe_layer",
+            category="model_structure",
+            args={
+                "decode_index": trace.current_decode_index,
+                "layer": self.layer_idx,
+                "top_k": self.gate.top_k,
+                "capacity": self.experts.capacity,
+            },
+        ) as event_args:
+            try:
+                return self._call_impl(hidden_states, trace=trace)
+            finally:
+                after = self.experts.stats()
+                event_args.update(
+                    {
+                        "expert_cache_hits": after.hits - before.hits,
+                        "expert_misses": after.misses - before.misses,
+                        "expert_evictions": after.evictions - before.evictions,
+                    }
+                )
+
+    def _call_impl(
+        self,
+        hidden_states: mx.array,
+        *,
+        trace: DecodeTrace | None,
+    ) -> mx.array:
         original_shape = hidden_states.shape
         rows = hidden_states.reshape(-1, self.hidden_size)
-        _, weights, indices = self.gate(rows)
+        router_context = (
+            trace.span(
+                "router_graph_construct",
+                category="mlx_submit",
+                args={
+                    "decode_index": trace.current_decode_index,
+                    "layer": self.layer_idx,
+                    "semantics": "router graph construction, not GPU kernel time",
+                },
+            )
+            if trace is not None
+            else nullcontext({})
+        )
+        with router_context:
+            _, weights, indices = self.gate(rows)
         if isinstance(self.experts, NativeExpertSSD):
             # Native reads run on I/O workers while the independent resident
             # shared expert executes on Metal.
             route_plan = self.experts.prepare(indices)
-            shared = self.shared_experts(rows)
-            mx.async_eval(shared)
+            shared_context = (
+                trace.span(
+                    "shared_expert_async_eval",
+                    category="mlx_submit",
+                    args={
+                        "decode_index": trace.current_decode_index,
+                        "layer": self.layer_idx,
+                        "semantics": (
+                            "shared-expert GPU enqueue while SSD reads are live"
+                        ),
+                    },
+                )
+                if trace is not None
+                else nullcontext({})
+            )
+            with shared_context:
+                shared = self.shared_experts(rows)
+                mx.async_eval(shared)
             route_outputs = self.experts.finish(rows, route_plan)
         else:
             route_outputs = self.experts(rows, indices)
             shared = self.shared_experts(rows)
-        routed = mx.sum(route_outputs * weights[..., None], axis=-2)
-        self.last_route = self.experts.last_expert_ids
-        return (routed + shared).reshape(original_shape)
+        merge_context = (
+            trace.span(
+                "moe_merge_graph_construct",
+                category="mlx_submit",
+                args={
+                    "decode_index": trace.current_decode_index,
+                    "layer": self.layer_idx,
+                    "semantics": "weighted top-k and shared-expert merge graph",
+                },
+            )
+            if trace is not None
+            else nullcontext({})
+        )
+        with merge_context:
+            routed = mx.sum(route_outputs * weights[..., None], axis=-2)
+            self.last_route = self.experts.last_expert_ids
+            return (routed + shared).reshape(original_shape)
