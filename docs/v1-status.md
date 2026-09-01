@@ -1,5 +1,9 @@
 # V1 implementation status
 
+> Historical milestone: this documents the initial stock-MLX correctness
+> path. The native direct-to-slot implementation that supersedes it is recorded
+> in [`native-expertssd-status.md`](native-expertssd-status.md).
+
 This checkpoint records the correctness-first implementation and its first
 successful full-model token run.
 

@@ -4,3 +4,11 @@ __pycache__/
 *.egg-info/
 *.py[cod]
 .DS_Store
+
+# Reproducible native MLX checkout and generated wheel overlay.
+/native/mlx-io-glm/
+/native/dist/
+/native/testsite/
+/native/.dist-stage.*/
+/native/.testsite-stage.*/
+*.whl

@@ -24,8 +24,13 @@ class ReaderStats:
     system_reads: int
     read_bytes: int
     open_shards: int
+    backend: str = "python-pread"
+    direct_to_slot: bool = False
+    read_seconds: float = 0.0
+    io_wait_seconds: float = 0.0
+    wired_bytes: int = 0
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | float | str | bool]:
         return asdict(self)
 
 

@@ -21,8 +21,11 @@ class ExpertCacheStats:
     hits: int
     misses: int
     evictions: int
+    route_sync_seconds: float = 0.0
+    slot_plan_seconds: float = 0.0
+    policy: str = "lru"
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | float | str]:
         return asdict(self)
 
 

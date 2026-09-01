@@ -9,5 +9,11 @@ if [[ ! -x "$python_bin" ]]; then
   exit 2
 fi
 
-export PYTHONPATH="$project_root/src${PYTHONPATH:+:$PYTHONPATH}"
+native_overlay="$project_root/native/testsite"
+if [[ ! -d "$native_overlay" ]]; then
+  print -u2 "mlx-io-glm overlay is missing. Run ./build.sh first."
+  exit 2
+fi
+
+export PYTHONPATH="$native_overlay:$project_root/src${PYTHONPATH:+:$PYTHONPATH}"
 exec "$python_bin" -m glm53flash.chat_cli "$@"
