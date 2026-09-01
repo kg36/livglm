@@ -27,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-tokens", type=int, default=None, metavar="N", help="maximum output tokens")
     parser.add_argument("--thinking", action="store_true", help="enable thinking mode")
+    parser.add_argument(
+        "--resident-bf16",
+        action="store_true",
+        help="retain the BF16 resident correctness oracle instead of startup MXFP8",
+    )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_DIR, metavar="PATH", help=argparse.SUPPRESS)
     parser.add_argument("--preflight", action="store_true", help="validate metadata and print the runtime plan only")
     return parser
@@ -122,7 +127,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.preflight:
-        result = TargetRuntime.preflight(args.model, memory_gib=args.memory)
+        result = TargetRuntime.preflight(
+            args.model,
+            memory_gib=args.memory,
+            resident_mxfp8=not args.resident_bf16,
+        )
         print(json.dumps(result.as_dict(), indent=2))
         return 0
     if args.chat and args.prompt:
@@ -132,13 +141,19 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         "Loading GLM-5.3-Flash resident weights; routed experts stay on SSD "
-        "(native MXFP4 ExpertSSD, no ScaleX)…",
+        f"({'BF16 oracle' if args.resident_bf16 else 'startup MXFP8'} resident, "
+        "native MXFP4 ExpertSSD, no ScaleX)…",
         file=sys.stderr,
         flush=True,
     )
-    runtime = TargetRuntime.load(args.model, memory_gib=args.memory)
+    runtime = TargetRuntime.load(
+        args.model,
+        memory_gib=args.memory,
+        resident_mxfp8=not args.resident_bf16,
+    )
     print(
-        f"Ready: {runtime.profile.resident_gib:.2f} GiB resident, "
+        f"Ready: {runtime.profile.resident_gib:.2f} GiB "
+        f"{runtime.profile.resident_format.upper()} resident, "
         f"{runtime.profile.expert_capacity} ExpertSSD slots/layer, "
         f"{runtime.profile.expert_cache_gib:.2f} GiB expert cache, "
         f"{runtime.profile.planned_gib:.2f}/{runtime.profile.effective_gib:.2f} "

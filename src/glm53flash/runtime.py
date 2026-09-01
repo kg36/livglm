@@ -37,7 +37,10 @@ class RuntimeProfile:
     requested_gib: float
     effective_gib: float
     physical_gib: float
+    resident_format: str
     resident_gib: float
+    resident_load_gib: float
+    resident_linear_count: int
     runtime_reserve_gib: float
     expert_capacity: int
     expert_cache_gib: float
@@ -45,7 +48,7 @@ class RuntimeProfile:
     budget_headroom_gib: float
     context_limit: int = CONTEXT_LIMIT
 
-    def as_dict(self) -> dict[str, float | int]:
+    def as_dict(self) -> dict[str, float | int | str]:
         return asdict(self)
 
 
@@ -62,6 +65,9 @@ def resolve_runtime_profile(
     requested_gib: float | None,
     *,
     resident_bytes: int = 17_842_600_184,
+    resident_load_bytes: int | None = None,
+    resident_format: str = "bf16",
+    resident_linear_count: int = 0,
     physical_bytes: int | None = None,
 ) -> RuntimeProfile:
     physical_gib = (physical_bytes or physical_memory_bytes()) / 2**30
@@ -70,6 +76,7 @@ def resolve_runtime_profile(
         raise ContractError("--memory must be a positive finite number")
     effective = min(requested, physical_gib - SYSTEM_RESERVE_GIB)
     resident_gib = resident_bytes / 2**30
+    resident_load_gib = (resident_load_bytes or resident_bytes) / 2**30
     available = (effective - resident_gib - RUNTIME_RESERVE_GIB) * 2**30
     affordable_capacity = math.floor(available / (MOE_LAYER_COUNT * EXPERT_SLOT_BYTES))
     if affordable_capacity < MINIMUM_EXPERT_CAPACITY:
@@ -95,7 +102,10 @@ def resolve_runtime_profile(
         requested_gib=requested,
         effective_gib=effective,
         physical_gib=physical_gib,
+        resident_format=resident_format,
         resident_gib=resident_gib,
+        resident_load_gib=resident_load_gib,
+        resident_linear_count=resident_linear_count,
         runtime_reserve_gib=RUNTIME_RESERVE_GIB,
         expert_capacity=capacity,
         expert_cache_gib=cache_gib,
@@ -198,6 +208,7 @@ class TargetRuntime:
         model: GLMForCausalLM,
         expert_reader: NativeExpertPool,
         resident_stats: ResidentReaderStats,
+        resident_quantization: dict[str, int | str],
         tokenizer,
         active_memory_bytes: int,
         peak_memory_bytes: int,
@@ -208,6 +219,7 @@ class TargetRuntime:
         self.model = model
         self.expert_reader = expert_reader
         self.resident_stats = resident_stats
+        self.resident_quantization = resident_quantization
         self.tokenizer = tokenizer
         self.active_memory_bytes = active_memory_bytes
         self.peak_memory_bytes = peak_memory_bytes
@@ -219,6 +231,7 @@ class TargetRuntime:
         *,
         memory_gib: float | None = None,
         physical_bytes: int | None = None,
+        resident_mxfp8: bool = True,
     ) -> PreflightResult:
         contract = ModelContract.from_model_dir(model_dir)
         contract.validate_supported_profile()
@@ -227,7 +240,16 @@ class TargetRuntime:
         experts = build_native_expert_source_plan(contract, config)
         profile = resolve_runtime_profile(
             memory_gib,
-            resident_bytes=resident.destination_bytes,
+            resident_bytes=(
+                resident.mxfp8_runtime_bytes
+                if resident_mxfp8
+                else resident.destination_bytes
+            ),
+            resident_load_bytes=resident.destination_bytes,
+            resident_format="mxfp8" if resident_mxfp8 else "bf16",
+            resident_linear_count=(
+                resident.mxfp8_linear_count if resident_mxfp8 else 0
+            ),
             physical_bytes=physical_bytes,
         )
         return PreflightResult(str(contract.model_dir), resident, experts, profile)
@@ -238,8 +260,13 @@ class TargetRuntime:
         model_dir: str | Path = DEFAULT_MODEL_DIR,
         *,
         memory_gib: float | None = None,
+        resident_mxfp8: bool = True,
     ) -> "TargetRuntime":
-        preflight = cls.preflight(model_dir, memory_gib=memory_gib)
+        preflight = cls.preflight(
+            model_dir,
+            memory_gib=memory_gib,
+            resident_mxfp8=resident_mxfp8,
+        )
         contract = ModelContract.from_model_dir(preflight.model_dir)
         config = GLMTextConfig.from_model_dict(contract.config)
         expert_reader = NativeExpertPool(preflight.expert_plan, workers=8)
@@ -251,6 +278,7 @@ class TargetRuntime:
                 layer=layer,
                 capacity=preflight.profile.expert_capacity,
                 swiglu_limit=config.swiglu_limit,
+                defer_slots=True,
             )
 
         try:
@@ -272,6 +300,30 @@ class TargetRuntime:
                 expert_factory=make_experts,
             )
             resident_stats = NativeResidentReader(preflight.resident_plan).load_into(model)
+            if preflight.profile.resident_format == "mxfp8":
+                quantization = model.quantize_resident_linears_mxfp8()
+                expected = {
+                    "format": "mxfp8",
+                    "linear_count": preflight.resident_plan.mxfp8_linear_count,
+                    "source_bytes": preflight.resident_plan.mxfp8_source_linear_bytes,
+                    "destination_bytes": (
+                        preflight.resident_plan.mxfp8_destination_linear_bytes
+                    ),
+                }
+                if quantization != expected:
+                    raise ContractError(
+                        f"resident MXFP8 conversion inventory changed: "
+                        f"{quantization} != {expected}"
+                    )
+            else:
+                quantization = {
+                    "format": "bf16",
+                    "linear_count": 0,
+                    "source_bytes": 0,
+                    "destination_bytes": 0,
+                }
+            for expert_layer in model.expert_layers():
+                expert_layer.experts.activate()
             mx.eval(model.parameters())
             try:
                 mx.clear_cache()
@@ -286,6 +338,9 @@ class TargetRuntime:
                     f"{preflight.profile.effective_gib:.3f} GiB"
                 )
         except BaseException:
+            if "model" in locals():
+                for expert_layer in model.expert_layers():
+                    expert_layer.experts.close()
             expert_reader.close()
             raise
         return cls(
@@ -295,6 +350,7 @@ class TargetRuntime:
             model=model,
             expert_reader=expert_reader,
             resident_stats=resident_stats,
+            resident_quantization=quantization,
             tokenizer=tokenizer,
             active_memory_bytes=active_memory_bytes,
             peak_memory_bytes=peak_memory_bytes,

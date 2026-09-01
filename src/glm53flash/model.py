@@ -6,6 +6,7 @@ from collections.abc import Callable
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from .cache import DSACache, KDACache, LayerCache, ModelCache
 from .contract import ContractError
@@ -159,3 +160,34 @@ class GLMForCausalLM(nn.Module):
     def expert_layers(self) -> tuple[ExpertSSDMoE, ...]:
         values = [layer.mlp for layer in self.language_model.layers]
         return tuple(value for value in values if isinstance(value, ExpertSSDMoE))
+
+    def quantize_resident_linears_mxfp8(self) -> dict[str, int | str]:
+        modules: list[DeferredLinear] = []
+        seen: set[int] = set()
+        for _, module in tree_flatten(
+            self.leaf_modules(),
+            is_leaf=lambda value: isinstance(value, DeferredLinear),
+        ):
+            if (
+                isinstance(module, DeferredLinear)
+                and module.quantize_resident
+                and id(module) not in seen
+            ):
+                seen.add(id(module))
+                modules.append(module)
+
+        source_bytes = 0
+        destination_bytes = 0
+        for index, module in enumerate(modules):
+            source, destination = module.quantize_to_mxfp8()
+            source_bytes += source
+            destination_bytes += destination
+            if index % 32 == 31:
+                mx.clear_cache()
+        mx.clear_cache()
+        return {
+            "format": "mxfp8",
+            "linear_count": len(modules),
+            "source_bytes": source_bytes,
+            "destination_bytes": destination_bytes,
+        }

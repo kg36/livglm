@@ -11,6 +11,7 @@ from .contract import ContractError, ModelContract, TensorSource
 
 COPY = "copy"
 BLOCK_FP8_TO_BF16 = "block_fp8_to_bf16"
+MXFP8_GROUP_SIZE = 32
 HC_RE = re.compile(
     r"^(language_model\.layers\.\d+)\.hc_(attn|ffn)_(fn|base|scale)$"
 )
@@ -72,6 +73,51 @@ class ResidentSourcePlan:
     def destination_bytes(self) -> int:
         return sum(tensor.destination_bytes for tensor in self.tensors)
 
+    @staticmethod
+    def _mxfp8_linear(tensor: ResidentTensorPlan) -> bool:
+        name = tensor.destination_name
+        return (
+            len(tensor.destination_shape) == 2
+            and name.endswith(".weight")
+            and ".indexer." not in name
+            and "embed_tokens" not in name
+            and not name.endswith(".mlp.gate.weight")
+        )
+
+    @property
+    def mxfp8_linear_count(self) -> int:
+        return sum(self._mxfp8_linear(tensor) for tensor in self.tensors)
+
+    @property
+    def mxfp8_source_linear_bytes(self) -> int:
+        return sum(
+            tensor.destination_bytes
+            for tensor in self.tensors
+            if self._mxfp8_linear(tensor)
+        )
+
+    @property
+    def mxfp8_destination_linear_bytes(self) -> int:
+        total = 0
+        for tensor in self.tensors:
+            if not self._mxfp8_linear(tensor):
+                continue
+            elements = tensor.destination_shape[0] * tensor.destination_shape[1]
+            if elements % MXFP8_GROUP_SIZE:
+                raise ContractError(
+                    f"resident MXFP8 group geometry changed: {tensor.destination_name}"
+                )
+            total += elements + elements // MXFP8_GROUP_SIZE
+        return total
+
+    @property
+    def mxfp8_runtime_bytes(self) -> int:
+        return (
+            self.destination_bytes
+            - self.mxfp8_source_linear_bytes
+            + self.mxfp8_destination_linear_bytes
+        )
+
     @property
     def shard_count(self) -> int:
         return len({tensor.shard_name for tensor in self.tensors})
@@ -93,6 +139,8 @@ class ResidentSourcePlan:
             "runtime_tensor_count": self.runtime_tensor_count,
             "source_bytes": self.source_bytes,
             "destination_bytes": self.destination_bytes,
+            "mxfp8_runtime_bytes": self.mxfp8_runtime_bytes,
+            "mxfp8_linear_count": self.mxfp8_linear_count,
             "shard_count": self.shard_count,
             "transforms": {
                 COPY: sum(tensor.transform == COPY for tensor in self.tensors),
@@ -184,5 +232,16 @@ def build_resident_source_plan(contract: ModelContract) -> ResidentSourcePlan:
         if plan.destination_bytes != 17_842_600_184:
             raise ContractError(
                 f"resident destination byte budget changed: {plan.destination_bytes}"
+            )
+        expected_mxfp8 = (497, 16_230_907_904, 8_369_061_888, 9_980_754_168)
+        actual_mxfp8 = (
+            plan.mxfp8_linear_count,
+            plan.mxfp8_source_linear_bytes,
+            plan.mxfp8_destination_linear_bytes,
+            plan.mxfp8_runtime_bytes,
+        )
+        if actual_mxfp8 != expected_mxfp8:
+            raise ContractError(
+                f"resident MXFP8 budget changed: {actual_mxfp8} != {expected_mxfp8}"
             )
     return plan

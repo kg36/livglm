@@ -1,5 +1,10 @@
 # Native ExpertSSD status
 
+> Historical native-I/O milestone: the BF16-resident measurements below are
+> preserved as the optimization baseline. The default runtime now performs an
+> in-memory MXFP8 resident conversion; see
+> [`mxfp8-performance.md`](mxfp8-performance.md).
+
 Date: 2026-09-01
 
 ## Outcome

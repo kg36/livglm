@@ -18,19 +18,63 @@ def require_weight(value: mx.array | None, name: str) -> mx.array:
 class DeferredLinear(nn.Module):
     """A linear layer whose storage is attached by the streamed loader."""
 
-    def __init__(self, input_dims: int, output_dims: int, *, bias: bool = False):
+    def __init__(
+        self,
+        input_dims: int,
+        output_dims: int,
+        *,
+        bias: bool = False,
+        quantize_resident: bool = True,
+    ):
         super().__init__()
         self.input_dims = input_dims
         self.output_dims = output_dims
         self.weight = None
+        self.scales = None
+        self.quantization_mode = None
+        self.quantize_resident = quantize_resident
         self.bias = None if bias else False
 
     def __call__(self, x: mx.array) -> mx.array:
         weight = require_weight(self.weight, "linear.weight")
-        result = x @ weight.T
+        if self.quantization_mode == "mxfp8":
+            result = mx.quantized_matmul(
+                x,
+                weight,
+                require_weight(self.scales, "linear.scales"),
+                transpose=True,
+                group_size=32,
+                bits=8,
+                mode="mxfp8",
+            )
+        else:
+            result = x @ weight.T
         if self.bias is not False:
             result = result + require_weight(self.bias, "linear.bias")
         return result
+
+    def quantize_to_mxfp8(self) -> tuple[int, int]:
+        if not self.quantize_resident:
+            raise ContractError("this deferred linear is excluded from resident MXFP8")
+        if self.quantization_mode is not None:
+            raise ContractError("deferred linear was already quantized")
+        weight = require_weight(self.weight, "linear.weight")
+        if weight.ndim != 2 or weight.shape[-1] % 32:
+            raise ContractError(
+                f"resident MXFP8 requires a group-32 matrix: {tuple(weight.shape)}"
+            )
+        source_bytes = weight.nbytes
+        packed, scales = mx.quantize(
+            weight,
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+        )
+        mx.eval(packed, scales)
+        self.weight = packed
+        self.scales = scales
+        self.quantization_mode = "mxfp8"
+        return source_bytes, packed.nbytes + scales.nbytes
 
 
 class DeferredEmbedding(nn.Module):
@@ -52,10 +96,11 @@ class RMSNorm(nn.Module):
         self.weight = None
 
     def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
-        x32 = x.astype(mx.float32)
-        normalized = x32 * mx.rsqrt(mx.mean(mx.square(x32), axis=-1, keepdims=True) + self.eps)
-        return normalized.astype(dtype) * require_weight(self.weight, "rms_norm.weight")
+        return mx.fast.rms_norm(
+            x,
+            require_weight(self.weight, "rms_norm.weight"),
+            self.eps,
+        )
 
 
 class UnweightedRMSNorm(nn.Module):
@@ -64,8 +109,7 @@ class UnweightedRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        x32 = x.astype(mx.float32)
-        return x32 * mx.rsqrt(mx.mean(mx.square(x32), axis=-1, keepdims=True) + self.eps)
+        return mx.fast.rms_norm(x.astype(mx.float32), None, self.eps)
 
 
 class GatedRMSNorm(nn.Module):
@@ -77,9 +121,11 @@ class GatedRMSNorm(nn.Module):
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         dtype = x.dtype
-        x32 = x.astype(mx.float32)
-        normalized = x32 * mx.rsqrt(mx.mean(mx.square(x32), axis=-1, keepdims=True) + self.eps)
-        normalized = normalized * require_weight(self.weight, "gated_rms_norm.weight").astype(mx.float32)
+        normalized = mx.fast.rms_norm(
+            x.astype(mx.float32),
+            require_weight(self.weight, "gated_rms_norm.weight").astype(mx.float32),
+            self.eps,
+        )
         return (normalized * mx.sigmoid(gate.astype(mx.float32))).astype(dtype)
 
 
