@@ -23,6 +23,9 @@ composite safetensors files and `mlx-io-glm` reads misses directly into fixed,
 wired per-layer slot arrays. A native Markov-LHD policy reuses experts across
 tokens, while eight workers issue independent SSD reads in parallel. There is
 no full resident expert-bank fallback and the runtime does not use ScaleX.
+At startup, 497 active resident linear weights are converted in memory to
+group-32 MXFP8; the official checkpoint is never rewritten. Use
+`--resident-bf16` to retain the slower correctness-oracle representation.
 
 Default artifact location:
 
@@ -62,14 +65,18 @@ The command UX follows the DeepSeek project:
 ./run.sh --memory 24 --max-tokens 1 "Say hello in one word."
 ./run.sh --chat --memory 24
 ./run.sh --thinking --max-tokens 8 "Explain mHC briefly."
+./run.sh --resident-bf16 --memory 30 --max-tokens 1 "Say hello."
 ```
 
 `--memory` is a hard total MLX runtime ceiling, not an expert-cache allowance.
-The runtime first reserves the resident graph and 3 GiB of execution headroom,
-then converts only the remainder into equal-capacity ExpertSSD caches across all
-42 routed layers. For example, `--memory 30` selects 19 slots per layer and a
-29.553 GiB total plan. The prompt still runs one token at a time through
-recurrent KDA, and total prompt-plus-output context is capped at 128 tokens.
+The runtime first reserves the selected resident graph and 3 GiB of execution
+headroom, then converts only the remainder into equal-capacity ExpertSSD caches
+across all 42 routed layers. With default MXFP8 resident execution,
+`--memory 30` selects 33 slots per layer and a 29.553 GiB plan. The BF16 oracle
+selects 19 slots under the same ceiling. Expert slots are allocated only after
+the startup conversion, so the temporary BF16 graph cannot overlap the larger
+cache. The prompt still runs one token at a time through recurrent KDA, and
+total prompt-plus-output context is capped at 128 tokens.
 DSA uses its real MLA projections but skips indexer scoring only inside the
 mathematically equivalent short-context domain where every visible key fits
 within the official 2,048-key selection budget. Vision, MTP, chunked prefill,
@@ -78,4 +85,5 @@ and ScaleX remain outside this runtime.
 See [`docs/v1-impl.md`](docs/v1-impl.md) for the original correctness plan,
 [`docs/v1-status.md`](docs/v1-status.md) for the first-token milestone, and
 [`docs/native-expertssd-status.md`](docs/native-expertssd-status.md) for the
-current native implementation and measurements.
+native I/O milestone. Current performance measurements are in
+[`docs/mxfp8-performance.md`](docs/mxfp8-performance.md).

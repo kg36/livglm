@@ -21,10 +21,19 @@ class DormantDSAIndexer(nn.Module):
         self.wq_b = DeferredLinear(
             config.q_lora_rank,
             config.index_n_heads * config.index_head_dim,
+            quantize_resident=False,
         )
-        self.wk = DeferredLinear(config.hidden_size, config.index_head_dim)
+        self.wk = DeferredLinear(
+            config.hidden_size,
+            config.index_head_dim,
+            quantize_resident=False,
+        )
         self.k_norm = DeferredLayerNorm(config.index_head_dim)
-        self.weights_proj = DeferredLinear(config.hidden_size, config.index_n_heads)
+        self.weights_proj = DeferredLinear(
+            config.hidden_size,
+            config.index_n_heads,
+            quantize_resident=False,
+        )
         self.index_kpool_compress_ape = None
         self.index_kpool_compress_gate = None
 

@@ -12,6 +12,10 @@ def test_cli_keeps_basic_deepseek_user_surface():
     assert args.memory == 24
     assert args.max_tokens == 1
     assert args.thinking
+    assert not args.resident_bf16
+
+    oracle = build_parser().parse_args(["--resident-bf16", "hello"])
+    assert oracle.resident_bf16
 
 
 def test_cli_help_does_not_load_model(capsys):

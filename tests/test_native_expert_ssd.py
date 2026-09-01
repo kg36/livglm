@@ -113,8 +113,12 @@ def test_native_direct_slots_match_python_reader_and_reuse_rows(tmp_path):
         capacity=2,
         swiglu_limit=10.0,
         wire_slots=False,
+        defer_slots=True,
     )
     try:
+        with pytest.raises(RuntimeError, match="not activated"):
+            native(x, indices)
+        native.activate()
         actual = native(x, indices)
         mx.eval(actual)
         np.testing.assert_array_equal(np.array(actual), np.array(expected))

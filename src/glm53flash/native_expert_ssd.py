@@ -276,6 +276,7 @@ class NativeExpertSSD(nn.Module):
         capacity: int,
         swiglu_limit: float,
         wire_slots: bool = True,
+        defer_slots: bool = False,
     ):
         super().__init__()
         if capacity < 1:
@@ -285,13 +286,10 @@ class NativeExpertSSD(nn.Module):
         self.layer = layer
         self.capacity = capacity
         self.swiglu_limit = swiglu_limit
-        self.slots = self.source.allocate_slots(capacity)
-        self.wired_bytes = (
-            int(mx._expert_ssd_wire_arrays(list(self.slots)))
-            if wire_slots
-            else 0
-        )
-        self.pool.add_wired_bytes(self.wired_bytes)
+        self._wire_slots = wire_slots
+        self.slots: tuple[mx.array, ...] = ()
+        self.wired_bytes = 0
+        self._active = False
         self._expert_to_slot: OrderedDict[int, int] = OrderedDict()
         self._reset_policy()
         self._hits = 0
@@ -301,6 +299,22 @@ class NativeExpertSSD(nn.Module):
         self._slot_plan_seconds = 0.0
         self._closed = False
         self.last_expert_ids: tuple[int, ...] = ()
+        if not defer_slots:
+            self.activate()
+
+    def activate(self) -> None:
+        if self._closed:
+            raise RuntimeError("native ExpertSSD layer is closed")
+        if self._active:
+            return
+        self.slots = self.source.allocate_slots(self.capacity)
+        self.wired_bytes = (
+            int(mx._expert_ssd_wire_arrays(list(self.slots)))
+            if self._wire_slots
+            else 0
+        )
+        self.pool.add_wired_bytes(self.wired_bytes)
+        self._active = True
 
     def _reset_policy(self) -> None:
         self._markov_state = mx._expert_ssd_markov_state_new(
@@ -321,6 +335,8 @@ class NativeExpertSSD(nn.Module):
     def prepare(self, indices: mx.array) -> NativeRoutePlan:
         if self._closed:
             raise RuntimeError("native ExpertSSD layer is closed")
+        if not self._active:
+            raise RuntimeError("native ExpertSSD slots were not activated")
         if indices.ndim < 1 or indices.shape[-1] < 1:
             raise ContractError("routed expert indices must have a top-k dimension")
         route_started = time.perf_counter()
@@ -468,3 +484,4 @@ class NativeExpertSSD(nn.Module):
         self._closed = True
         if self.wired_bytes:
             mx._expert_ssd_unwire_arrays(list(self.slots))
+        self._active = False
