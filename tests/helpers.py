@@ -1,0 +1,56 @@
+from dataclasses import replace
+
+from glm53flash.model_config import GLMTextConfig
+
+
+def tiny_config(**overrides) -> GLMTextConfig:
+    config = GLMTextConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        first_k_dense_replace=3,
+        layer_types=(
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "deepseek_sparse_attention",
+        ),
+        mlp_layer_types=("dense", "dense", "dense", "sparse"),
+        hidden_act="silu",
+        swiglu_limit=10.0,
+        rms_norm_eps=1e-6,
+        hc_mult=2,
+        hc_sinkhorn_iters=3,
+        hc_eps=1e-6,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        q_lora_rank=16,
+        kv_lora_rank=8,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=0,
+        v_head_dim=8,
+        linear_num_heads=4,
+        linear_head_dim=8,
+        linear_conv_kernel=4,
+        linear_gate_lower_bound=-5.0,
+        index_n_heads=2,
+        index_head_dim=8,
+        index_topk=64,
+        index_kpool=4,
+        index_kpool_always_select_tail=True,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        n_group=1,
+        topk_group=1,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        eos_token_ids=(2, 3),
+        pad_token_id=0,
+        max_position_embeddings=1024,
+    )
+    return replace(config, **overrides)

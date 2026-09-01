@@ -1,0 +1,17 @@
+{
+  "official_remainder": {
+    "repo": "zai-org/GLM-5.3-Flash",
+    "revision": "03eb5366286afd40d2221b1d9c63a6dd1ba4832e",
+    "role": "Every tensor except routed-expert projection weights and scales"
+  },
+  "mxfp4_experts": {
+    "repo": "INCModel3/GLM-5.3-Flash-MXFP4-Mixed-CT-AutoRound",
+    "revision": "8712b4a299e2cbb81c019d2c20084fb99cbc2d00",
+    "role": "All routed expert projections in language layers 3 through 45"
+  },
+  "bf16_validation": {
+    "repo": "zai-org/GLM-5.3-Flash-BF16",
+    "revision": "61f77a1e1a67c410650ce5017411337da0dcd11a",
+    "role": "Range-fetched numerical reference used only by preflight validation"
+  }
+}
