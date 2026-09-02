@@ -165,6 +165,19 @@ class ExpertSSDMoE(nn.Module):
             with shared_context:
                 shared = self.shared_experts(rows)
                 mx.async_eval(shared)
+            if (
+                self.experts.source.scalex_mode_b
+                and rows.shape == (2, self.hidden_size)
+                and weights.shape == (2, self.gate.top_k)
+            ):
+                merged = self.experts.finish_width2_merged(
+                    rows,
+                    route_plan,
+                    weights,
+                    shared,
+                )
+                self.last_route = self.experts.last_expert_ids
+                return merged.reshape(original_shape)
             route_outputs = self.experts.finish(rows, route_plan)
         else:
             route_outputs = self.experts(rows, indices)

@@ -12,6 +12,7 @@ from typing import Any
 
 from .hf_range import copy_range_to_file, fetch_bytes, fetch_json, shard_url
 from .planner import load_or_build_plan
+from .scalex_container import is_scalex_layer
 from .sources import EXPERTS, OFFICIAL, SOURCES
 
 
@@ -151,6 +152,16 @@ def _download_support_files(destination: Path) -> None:
 
 def assemble(destination: Path, *, workers: int = 4) -> dict[str, Any]:
     destination.mkdir(parents=True, exist_ok=True)
+    converted = [
+        path.name
+        for path in destination.glob("model-*.safetensors")
+        if is_scalex_layer(path)
+    ]
+    if converted:
+        raise RuntimeError(
+            "download cannot run over a ScaleX checkpoint; restore it first with "
+            f"./converter --native (found {len(converted)} converted shard(s))"
+        )
     state_dir = destination / ".download"
     state_dir.mkdir(exist_ok=True)
     plan_path = state_dir / "assembly-plan.json"

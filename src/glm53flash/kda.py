@@ -113,8 +113,76 @@ class KDALinearAttention(nn.Module):
         return -decay * softplus
 
     def __call__(self, hidden_states: mx.array, cache: KDACache) -> mx.array:
-        if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
-            raise ContractError("v1 KDA is token-at-a-time only")
+        if hidden_states.ndim != 3 or hidden_states.shape[1] < 1:
+            raise ContractError("KDA requires one or more causal tokens")
+        if hidden_states.shape[1] > 1:
+            return self._wide(hidden_states, cache)
+        return self._token(hidden_states, cache)
+
+    def _wide(self, hidden_states: mx.array, cache: KDACache) -> mx.array:
+        """Joint projections with the exact causal recurrent scan."""
+
+        batch_size, width, _ = hidden_states.shape
+        hidden_shape = (batch_size, width, self.num_heads, self.head_dim)
+        q_projected = self.q_proj(hidden_states)
+        k_projected = self.k_proj(hidden_states)
+        v_projected = self.v_proj(hidden_states)
+        queries = []
+        keys = []
+        values = []
+        first_convs = None
+        for index in range(width):
+            query, cache.q_conv = self.q_conv1d.token(
+                q_projected[:, index : index + 1], cache.q_conv
+            )
+            key, cache.k_conv = self.k_conv1d.token(
+                k_projected[:, index : index + 1], cache.k_conv
+            )
+            value, cache.v_conv = self.v_conv1d.token(
+                v_projected[:, index : index + 1], cache.v_conv
+            )
+            queries.append(query)
+            keys.append(key)
+            values.append(value)
+            if index == 0:
+                first_convs = (cache.q_conv, cache.k_conv, cache.v_conv)
+
+        query = mx.concatenate(queries, axis=1)
+        key = mx.concatenate(keys, axis=1)
+        value = mx.concatenate(values, axis=1)
+        query = mx.sigmoid(query) * query
+        key = mx.sigmoid(key) * key
+        value = mx.sigmoid(value) * value
+        query = l2_normalize(query.reshape(hidden_shape)) / math.sqrt(self.head_dim)
+        key = l2_normalize(key.reshape(hidden_shape))
+        value = value.reshape(hidden_shape).astype(mx.float32)
+        forget = self._forget(hidden_states).astype(mx.float32)
+        beta = mx.sigmoid(self.b_proj(hidden_states).astype(mx.float32))
+
+        state = cache.recurrent
+        cores = []
+        first_state = None
+        for index in range(width):
+            q_i = query[:, index]
+            k_i = key[:, index]
+            v_i = value[:, index]
+            state = state * mx.exp(forget[:, index])[..., None]
+            recalled = mx.sum(state * k_i[..., None], axis=-2)
+            delta = (v_i - recalled) * beta[:, index, :, None]
+            state = state + k_i[..., None] * delta[..., None, :]
+            cores.append(mx.sum(state * q_i[..., None], axis=-2)[:, None])
+            if index == 0:
+                first_state = state
+        cache.recurrent = state
+        assert first_convs is not None and first_state is not None
+        cache._speculative_first = (*first_convs, first_state)
+
+        core = mx.concatenate(cores, axis=1)
+        gate = self.g_b_proj(self.g_a_proj(hidden_states)).reshape(hidden_shape)
+        output = self.o_norm(core.astype(hidden_states.dtype), gate)
+        return self.o_proj(output.reshape(batch_size, width, self.qkv_dim))
+
+    def _token(self, hidden_states: mx.array, cache: KDACache) -> mx.array:
         batch_size = hidden_states.shape[0]
         hidden_shape = (batch_size, 1, self.num_heads, self.head_dim)
 

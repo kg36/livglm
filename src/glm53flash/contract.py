@@ -6,10 +6,13 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import re
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from .hf_range import local_safetensors_header
 from .sources import EXPERTS, OFFICIAL
+
+if TYPE_CHECKING:
+    from .scalex_container import ScaleXLayout
 
 
 COMPOSITE_FORMAT = "livseek-glm53flash-composite-v1"
@@ -130,6 +133,7 @@ class ModelContract:
         self.weight_map: dict[str, str] = dict(weight_map)
         self._headers: dict[str, tuple[int, dict[str, Any]]] = {}
         self._sources: dict[str, TensorSource] = {}
+        self._scalex_layouts: dict[str, ScaleXLayout | None] = {}
 
     @classmethod
     def from_model_dir(cls, model_dir: str | Path) -> "ModelContract":
@@ -294,12 +298,26 @@ class ModelContract:
         if not path.is_file():
             raise ContractError(f"indexed shard is missing: {path}")
         try:
-            data_base, header = local_safetensors_header(path)
+            layout = self.scalex_layout(shard_name)
+            if layout is None:
+                data_base, header = local_safetensors_header(path)
+            else:
+                data_base, header = layout.virtual_data_base, layout.virtual_header
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise ContractError(f"cannot read safetensors header: {path}") from exc
         cached = (data_base, header)
         self._headers[shard_name] = cached
         return cached
+
+    def scalex_layout(self, shard_name: str) -> ScaleXLayout | None:
+        if shard_name in self._scalex_layouts:
+            return self._scalex_layouts[shard_name]
+        from .scalex_container import is_scalex_layer, read_scalex_layout
+
+        path = self.model_dir / shard_name
+        layout = read_scalex_layout(path) if is_scalex_layer(path) else None
+        self._scalex_layouts[shard_name] = layout
+        return layout
 
     def tensor(self, name: str) -> TensorSource:
         cached = self._sources.get(name)
@@ -326,7 +344,12 @@ class ModelContract:
                 f"invalid tensor byte range for {name}: {byte_length} != {expected}"
             )
         absolute_offset = data_base + start
-        shard_size = (self.model_dir / shard_name).stat().st_size
+        layout = self.scalex_layout(shard_name)
+        shard_size = (
+            layout.original_bytes
+            if layout is not None
+            else (self.model_dir / shard_name).stat().st_size
+        )
         if absolute_offset + byte_length > shard_size:
             raise ContractError(f"tensor exceeds shard size: {name}")
         source = TensorSource(

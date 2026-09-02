@@ -16,6 +16,7 @@ from .contract import (
     TensorSource,
 )
 from .model_config import GLMTextConfig
+from .scalex_container import ScaleXRecord
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class NativeExpertSource:
     expert: int
     tensors: tuple[ExpertTensorSource, ...]
     read_ranges: tuple[ExpertReadRange, ...]
+    scalex_record: ScaleXRecord | None = None
 
     @property
     def payload_bytes(self) -> int:
@@ -99,6 +101,41 @@ class NativeExpertSourcePlan:
         values = {len(pack.read_ranges) for pack in self.packs}
         return next(iter(values)) if len(values) == 1 else None
 
+    @property
+    def scalex_mode_b(self) -> bool:
+        return bool(self.packs) and self.packs[0].scalex_record is not None
+
+    @property
+    def source_format(self) -> str:
+        return "livglm_scalex_mode_b" if self.scalex_mode_b else "native_mxfp4"
+
+    def slot_bytes(self, layer: int) -> int:
+        sources = tuple(self.expert(layer, expert) for expert in range(self.experts_per_layer))
+        if self.scalex_mode_b:
+            records = tuple(source.scalex_record for source in sources)
+            if any(record is None for record in records):
+                raise ContractError(f"layer {layer} mixes ScaleX and native experts")
+            first = sources[0]
+            weight_bytes = sum(
+                tensor.byte_length
+                for tensor in first.tensors
+                if tensor.destination_name.endswith(".weight")
+            )
+            return weight_bytes + max(
+                record.mode_b_row_bytes for record in records if record is not None
+            )
+        sizes = {source.payload_bytes for source in sources}
+        if len(sizes) != 1:
+            raise ContractError(f"layer {layer} expert row sizes are not uniform")
+        return next(iter(sizes))
+
+    @property
+    def slot_bytes_by_layer(self) -> tuple[int, ...]:
+        return tuple(
+            self.slot_bytes(layer)
+            for layer in range(self.first_layer, self.last_layer + 1)
+        )
+
     def expert(self, layer: int, expert: int) -> NativeExpertSource:
         if not self.first_layer <= layer <= self.last_layer:
             raise ContractError(f"expert layer is out of range: {layer}")
@@ -125,6 +162,9 @@ class NativeExpertSourcePlan:
             "source_shard_count": self.source_shard_count,
             "uniform_pack_bytes": self.uniform_pack_bytes,
             "uniform_read_count": self.uniform_read_count,
+            "source_format": self.source_format,
+            "scalex_mode_b": self.scalex_mode_b,
+            "slot_bytes_by_layer": list(self.slot_bytes_by_layer),
             "layers": [
                 {
                     "layer": layer,
@@ -258,13 +298,55 @@ def build_native_expert_source_plan(
                         )
                     tensors.append(_destination_tensor(source, component, part))
             tensor_tuple = tuple(tensors)
-            ranges = _coalesce(tensor_tuple)
+            shard_names = {tensor.shard_name for tensor in tensor_tuple}
+            if len(shard_names) != 1:
+                raise ContractError(f"expert {layer}/{expert} spans multiple shards")
+            shard_name = next(iter(shard_names))
+            layout_getter = getattr(contract, "scalex_layout", None)
+            layout = layout_getter(shard_name) if layout_getter is not None else None
+            scale_record = None
+            if layout is None:
+                ranges = _coalesce(tensor_tuple)
+            else:
+                if layout.layer != layer:
+                    raise ContractError(
+                        f"ScaleX layer identity changed: {layout.layer} != {layer}"
+                    )
+                scale_record = layout.record(expert)
+                expected_scales = tuple(
+                    f"model.language_model.layers.{layer}.mlp.experts.{expert}."
+                    f"{component}.weight_scale"
+                    for component in ("gate_proj", "down_proj", "up_proj")
+                )
+                expected_weights = tuple(
+                    f"model.language_model.layers.{layer}.mlp.experts.{expert}."
+                    f"{component}.weight_packed"
+                    for component in ("gate_proj", "down_proj", "up_proj")
+                )
+                if (
+                    scale_record.scale_names != expected_scales
+                    or scale_record.weight_names != expected_weights
+                ):
+                    raise ContractError(
+                        f"ScaleX tensor order changed in layer {layer} expert {expert}"
+                    )
+                by_source = {tensor.source_name: tensor for tensor in tensor_tuple}
+                physical_tensors = tuple(by_source[name] for name in expected_weights)
+                ranges = (
+                    ExpertReadRange(
+                        shard_name=shard_name,
+                        absolute_offset=scale_record.absolute_offset,
+                        byte_length=scale_record.physical_bytes,
+                        tensors=physical_tensors,
+                    ),
+                )
             packs.append(
                 NativeExpertSource(
                     layer=layer,
                     expert=expert,
                     tensors=tensor_tuple,
                     read_ranges=ranges,
+                    scalex_record=scale_record,
                 )
             )
     plan = NativeExpertSourcePlan(
@@ -277,6 +359,9 @@ def build_native_expert_source_plan(
     expected_experts = (last_layer - first_layer + 1) * config.n_routed_experts
     if plan.expert_count != expected_experts or plan.tensor_count != expected_experts * 6:
         raise ContractError("native expert source inventory is incomplete")
+    formats = {pack.scalex_record is not None for pack in plan.packs}
+    if len(formats) != 1:
+        raise ContractError("main routed layers mix ScaleX and native MXFP4 shards")
     if (
         first_layer == FIRST_MOE_LAYER
         and last_layer == LAST_MAIN_LAYER
@@ -286,6 +371,11 @@ def build_native_expert_source_plan(
             raise ContractError(
                 f"native expert record size changed: {plan.uniform_pack_bytes}"
             )
-        if plan.uniform_read_count != 1 or plan.read_bytes != plan.payload_bytes:
+        if plan.uniform_read_count != 1:
             raise ContractError("native GLM experts are no longer exact one-range records")
+        if plan.scalex_mode_b:
+            if plan.read_bytes >= plan.payload_bytes:
+                raise ContractError("ScaleX expert payload did not shrink")
+        elif plan.read_bytes != plan.payload_bytes:
+            raise ContractError("native GLM expert read bytes changed")
     return plan

@@ -22,7 +22,10 @@ required to use **ExpertSSD**: native MXFP4 expert records remain in the
 composite safetensors files and `mlx-io-glm` reads misses directly into fixed,
 wired per-layer slot arrays. A native Markov-LHD policy reuses experts across
 tokens, while eight workers issue independent SSD reads in parallel. There is
-no full resident expert-bank fallback and the runtime does not use ScaleX.
+no full resident expert-bank fallback. Native MXFP4 safetensors remain the
+download format; an optional reversible converter can replace only the E8M0
+scale streams with lossless ScaleX records. Converted checkpoints are served
+directly in ScaleX Mode B without hydrating scales into the expert cache.
 At startup, 497 active resident linear weights are converted in memory to
 group-32 MXFP8; the official checkpoint is never rewritten. Use
 `--resident-bf16` to retain the slower correctness-oracle representation.
@@ -50,10 +53,22 @@ Commands:
 
 # Audit all safetensors and produce SHA256SUMS.
 ./scripts/validate.sh
+
+# Optional, non-mutating single-layer ScaleX qualification.
+./converter --layer 3 --output /path/to/layer-3.scalex \
+  /Users/kumargaurav/Documents/livglm/GLM53Flash
+
+# Transactionally convert all 42 served expert layers in place.
+./converter /Users/kumargaurav/Documents/livglm/GLM53Flash
+
+# Restore their exact original safetensors bytes.
+./converter --native /Users/kumargaurav/Documents/livglm/GLM53Flash
 ```
 
 `download.sh` may be run again after interruption. Do not delete `.download/`
-until validation has completed.
+until validation has completed. Once any shard is converted to ScaleX, the
+downloader stops instead of overwriting it; restore with `./converter --native`
+before intentionally resuming the download workflow.
 
 ## Runtime
 
@@ -78,18 +93,29 @@ The command UX follows the DeepSeek project:
 ```
 
 `--memory` is a hard total MLX runtime ceiling, not an expert-cache allowance.
-The runtime first reserves the selected resident graph and 3 GiB of execution
-headroom, then converts only the remainder into equal-capacity ExpertSSD caches
-across all 42 routed layers. With default MXFP8 resident execution,
-`--memory 30` selects 33 slots per layer and a 29.553 GiB plan. The BF16 oracle
-selects 19 slots under the same ceiling. Expert slots are allocated only after
-the startup conversion, so the temporary BF16 graph cannot overlap the larger
-cache. The prompt still runs one token at a time through recurrent KDA, and
-total prompt-plus-output context is capped at 128 tokens.
+The runtime reserves the selected resident graph, execution headroom, and the
+official layer-45 MTP drafter, then converts only the remainder into fixed
+ExpertSSD caches. With ScaleX, `--resident-mxfp4 --memory 30` gives the 42
+target layers 46 slots each and the MTP layer 48 slots. Expert slots are
+allocated only after startup conversion, so temporary source arrays cannot
+overlap the cache. The prompt still runs one token at a time through recurrent
+KDA, and total prompt-plus-output context is capped at 128 tokens.
 DSA uses its real MLA projections but skips indexer scoring only inside the
 mathematically equivalent short-context domain where every visible key fits
-within the official 2,048-key selection budget. Vision, MTP, chunked prefill,
-and ScaleX remain outside this runtime.
+within the official 2,048-key selection budget. Vision, chunked prefill, and
+batch prefill remain outside this runtime. The official MTP layer proposes one
+token and a width-two target pass verifies it; rejected drafts cannot alter the
+target result. ScaleX conversion is optional and automatically detected; a
+mixed native/ScaleX set of the 42 served layers is rejected until conversion
+or restoration is resumed to completion.
+
+On the canonical 30 GiB command below, a 44-token generation measured 4.890
+token/s over the complete decode and 5.225 token/s after the first 20 output
+tokens, with a 29.80 GiB observed MLX peak and 21/22 MTP drafts accepted:
+
+```bash
+./run.sh --memory 30 --resident-mxfp4 --max-tokens 60 "who are you"
+```
 
 See [`docs/v1-impl.md`](docs/v1-impl.md) for the original correctness plan,
 [`docs/v1-status.md`](docs/v1-status.md) for the first-token milestone, and
@@ -97,4 +123,6 @@ See [`docs/v1-impl.md`](docs/v1-impl.md) for the original correctness plan,
 native I/O milestone. Current performance measurements are in
 [`docs/mxfp8-performance.md`](docs/mxfp8-performance.md), and the first
 correlated Perfetto/Metal bottleneck analysis is in
-[`docs/perfetto-analysis.md`](docs/perfetto-analysis.md).
+[`docs/perfetto-analysis.md`](docs/perfetto-analysis.md). The lossless format,
+conversion safety and Mode-B runtime are documented in
+[`docs/scalex-mode-b.md`](docs/scalex-mode-b.md).

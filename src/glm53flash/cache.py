@@ -55,5 +55,49 @@ class ModelCache:
     layers: list[LayerCache]
     position: int = 0
 
-    def advance(self) -> None:
-        self.position += 1
+    def advance(self, tokens: int = 1) -> None:
+        self.position += int(tokens)
+
+    def snapshot(self) -> tuple[int, tuple[tuple[object, ...], ...]]:
+        """Capture array identities for an exact speculative rollback."""
+
+        layers: list[tuple[object, ...]] = []
+        for cache in self.layers:
+            if isinstance(cache, KDACache):
+                layers.append(
+                    ("kda", cache.q_conv, cache.k_conv, cache.v_conv, cache.recurrent)
+                )
+            else:
+                layers.append(("dsa", cache.keys, cache.values))
+        return self.position, tuple(layers)
+
+    def restore(self, snapshot: tuple[int, tuple[tuple[object, ...], ...]]) -> None:
+        position, layers = snapshot
+        if len(layers) != len(self.layers):
+            raise ValueError("cache snapshot layer inventory changed")
+        for cache, values in zip(self.layers, layers, strict=True):
+            if isinstance(cache, KDACache) and values[0] == "kda":
+                _, cache.q_conv, cache.k_conv, cache.v_conv, cache.recurrent = values
+            elif isinstance(cache, DSACache) and values[0] == "dsa":
+                _, cache.keys, cache.values = values
+            else:
+                raise ValueError("cache snapshot type changed")
+        self.position = int(position)
+
+    def commit_first_from_wide(
+        self,
+        snapshot: tuple[int, tuple[tuple[object, ...], ...]],
+    ) -> None:
+        """Commit only verifier row zero without replaying the target."""
+
+        position, _ = snapshot
+        for cache in self.layers:
+            values = getattr(cache, "_speculative_first", None)
+            if values is None:
+                raise ValueError("wide target cache did not stage its first row")
+            if isinstance(cache, KDACache):
+                cache.q_conv, cache.k_conv, cache.v_conv, cache.recurrent = values
+            else:
+                cache.keys, cache.values = values
+            delattr(cache, "_speculative_first")
+        self.position = int(position) + 1

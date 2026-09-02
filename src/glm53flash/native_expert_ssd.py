@@ -40,6 +40,15 @@ _REQUIRED_NATIVE_SYMBOLS = (
     "_expert_ssd_unwire_arrays",
 )
 
+_REQUIRED_SCALEX_SYMBOLS = (
+    "_open_scalex_mode_a_direct",
+    "_scalex_mode_b_load_experts_into_many",
+    "_expert_ssd_scalex_mxfp4_qmv",
+    "_expert_ssd_scalex_mxfp4_qmv_split_routes",
+    "_expert_ssd_scalex_mxfp4_width2_pair_qmv",
+    "_expert_ssd_scalex_mxfp4_width2_down_reduce",
+)
+
 
 def native_expert_ssd_available() -> bool:
     return all(hasattr(mx, name) for name in _REQUIRED_NATIVE_SYMBOLS)
@@ -100,6 +109,18 @@ class NativeExpertPool:
         self.workers = workers
         self.no_file_cache = no_file_cache
         self.read_ahead = read_ahead
+        if plan.scalex_mode_b:
+            missing = [name for name in _REQUIRED_SCALEX_SYMBOLS if not hasattr(mx, name)]
+            if missing:
+                raise ContractError(
+                    "the mlx-io-glm overlay lacks ScaleX Mode B symbols: "
+                    + ", ".join(missing)
+                )
+        self.backend = (
+            "mlx-io-glm/direct-to-slot/ScaleX-Mode-B"
+            if plan.scalex_mode_b
+            else "mlx-io-glm/direct-to-slot"
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=workers,
             thread_name_prefix="glm-expert-ssd",
@@ -144,7 +165,7 @@ class NativeExpertPool:
                 "read_ranges": source.read_range_counts[int(expert)],
                 "payload_bytes": source.payload_bytes[int(expert)],
                 "shard": source.shard_name,
-                "backend": "mlx-io-glm/direct-to-slot",
+                "backend": self.backend,
             }
             trace.flow("s", flow_id, args=args)
             return self._executor.submit(
@@ -192,7 +213,7 @@ class NativeExpertPool:
                 system_reads=self._system_reads,
                 read_bytes=self._read_bytes,
                 open_shards=len(self._sources),
-                backend="mlx-io-glm/direct-to-slot",
+                backend=self.backend,
                 direct_to_slot=True,
                 read_seconds=self._read_seconds,
                 io_wait_seconds=self._io_wait_seconds,
@@ -213,6 +234,7 @@ class NativeExpertLayerSource:
         self.pool = pool
         self.plan = pool.plan
         self.layer = layer
+        self.scalex_mode_b = self.plan.scalex_mode_b
         sources = tuple(
             self.plan.expert(layer, expert)
             for expert in range(self.plan.experts_per_layer)
@@ -245,38 +267,86 @@ class NativeExpertLayerSource:
                 raise ContractError(
                     f"native ExpertSSD tensor layout changes within layer {layer}"
                 )
-        self.tensor_layouts = tuple(
-            (name, _DTYPES[dtype], tuple(shape))
-            for name, dtype, shape in canonical
-        )
-        raw_specs = [
-            [
-                (
-                    tensor.destination_name,
-                    tensor.mlx_dtype,
-                    list(tensor.mlx_shape),
-                    tensor.absolute_offset,
-                )
-                for tensor in source.tensors
-            ]
-            for source in sources
-        ]
-        self.handle = mx._open_expert_safetensors_direct(
-            shard_path,
-            raw_specs,
-            no_cache=pool.no_file_cache,
-            read_ahead=pool.read_ahead,
-        )
-        self.read_range_counts = tuple(
-            int(mx._expert_safetensors_direct_read_range_count(self.handle, expert))
-            for expert in range(self.plan.experts_per_layer)
-        )
-        expected = tuple(len(source.read_ranges) for source in sources)
-        if self.read_range_counts != expected:
-            raise ContractError(
-                f"native ExpertSSD range plan differs in layer {layer}: "
-                f"{self.read_range_counts} != {expected}"
+        self.scalex_handle = None
+        if self.scalex_mode_b:
+            records = tuple(source.scalex_record for source in sources)
+            if any(record is None for record in records):
+                raise ContractError(f"ScaleX layer {layer} has a native expert")
+            first_record = records[0]
+            assert first_record is not None
+            canonical_by_source = {
+                tensor.source_name: tensor for tensor in sources[0].tensors
+            }
+            scale_tensors = tuple(
+                canonical_by_source[name] for name in first_record.scale_names
             )
+            weight_tensors = tuple(
+                canonical_by_source[name] for name in first_record.weight_names
+            )
+            if tuple(tensor.byte_length for tensor in scale_tensors) != first_record.scale_nbytes:
+                raise ContractError(f"ScaleX decoded-scale geometry changed in layer {layer}")
+            if tuple(tensor.byte_length for tensor in weight_tensors) != first_record.weight_nbytes:
+                raise ContractError(f"ScaleX weight geometry changed in layer {layer}")
+            record_stride = max(
+                record.mode_b_row_bytes for record in records if record is not None
+            )
+            self.tensor_layouts = (
+                ("scalex_record", mx.uint8, (record_stride,)),
+                *(
+                    (
+                        tensor.destination_name,
+                        _DTYPES[tensor.mlx_dtype],
+                        tuple(tensor.mlx_shape),
+                    )
+                    for tensor in weight_tensors
+                ),
+            )
+            self.handle = None
+            self.scalex_handle = mx._open_scalex_mode_a_direct(
+                shard_path,
+                [
+                    [record.absolute_offset, record.encoded_bytes]
+                    for record in records
+                    if record is not None
+                ],
+                list(first_record.scale_nbytes),
+                no_cache=pool.no_file_cache,
+                read_ahead=pool.read_ahead,
+            )
+            self.read_range_counts = (1,) * self.plan.experts_per_layer
+        else:
+            self.tensor_layouts = tuple(
+                (name, _DTYPES[dtype], tuple(shape))
+                for name, dtype, shape in canonical
+            )
+            raw_specs = [
+                [
+                    (
+                        tensor.destination_name,
+                        tensor.mlx_dtype,
+                        list(tensor.mlx_shape),
+                        tensor.absolute_offset,
+                    )
+                    for tensor in source.tensors
+                ]
+                for source in sources
+            ]
+            self.handle = mx._open_expert_safetensors_direct(
+                shard_path,
+                raw_specs,
+                no_cache=pool.no_file_cache,
+                read_ahead=pool.read_ahead,
+            )
+            self.read_range_counts = tuple(
+                int(mx._expert_safetensors_direct_read_range_count(self.handle, expert))
+                for expert in range(self.plan.experts_per_layer)
+            )
+            expected = tuple(len(source.read_ranges) for source in sources)
+            if self.read_range_counts != expected:
+                raise ContractError(
+                    f"native ExpertSSD range plan differs in layer {layer}: "
+                    f"{self.read_range_counts} != {expected}"
+                )
         self.payload_bytes = tuple(source.read_bytes for source in sources)
 
     def allocate_slots(self, capacity: int) -> tuple[mx.array, ...]:
@@ -299,12 +369,21 @@ class NativeExpertLayerSource:
         destinations: tuple[mx.array, ...],
     ) -> float:
         started = time.perf_counter()
-        mx._expert_ssd_direct_load_into(
-            self.handle,
-            int(expert),
-            int(slot),
-            list(destinations),
-        )
+        if self.scalex_mode_b:
+            mx._scalex_mode_b_load_experts_into_many(
+                self.scalex_handle,
+                [int(expert)],
+                [int(slot)],
+                destinations[0],
+                list(destinations[1:]),
+            )
+        else:
+            mx._expert_ssd_direct_load_into(
+                self.handle,
+                int(expert),
+                int(slot),
+                list(destinations),
+            )
         return time.perf_counter() - started
 
 
@@ -530,11 +609,19 @@ class NativeExpertSSD(nn.Module):
             for index, (name, _, _) in enumerate(self.source.tensor_layouts)
         }
 
-        production_native_qmv = (
-            x.dtype == mx.bfloat16
-            and x.size == x.shape[-1]
-            and x.shape[-1] % 512 == 0
+        fixed_qmv_geometry = (
+            x.shape[-1] % 512 == 0
             and by_name["up_proj.weight"].shape[-2] % 8 == 0
+        )
+        production_native_qmv = (
+            fixed_qmv_geometry
+            and x.dtype == mx.bfloat16
+            and x.size == x.shape[-1]
+        )
+        scalex_qmv = (
+            self.source.scalex_mode_b
+            and fixed_qmv_geometry
+            and x.dtype in (mx.bfloat16, mx.float32)
         )
         trace = active_trace()
         with (
@@ -547,7 +634,13 @@ class NativeExpertSSD(nn.Module):
                     "routes": int(plan.remapped.size),
                     "misses": plan.misses,
                     "primitive": (
-                        "native_mxfp4_qmv" if production_native_qmv else "gather_qmm"
+                        "scalex_mxfp4_qmv"
+                        if scalex_qmv and production_native_qmv
+                        else "scalex_mxfp4_qmv_serial_prefill"
+                        if scalex_qmv
+                        else "native_mxfp4_qmv"
+                        if production_native_qmv
+                        else "gather_qmm"
                     ),
                     "semantics": (
                         "Python/native graph construction, not GPU kernel time"
@@ -557,6 +650,49 @@ class NativeExpertSSD(nn.Module):
             if trace is not None
             else nullcontext({})
         ):
+            if scalex_qmv:
+                route_width = plan.remapped.shape[-1]
+                # GLM's residual stream is FP32. Keep the conversion lazy in
+                # the MLX graph; the fixed ScaleX Metal kernel consumes BF16,
+                # matching the checkpoint's effective expert precision.
+                flat_x = x.astype(mx.bfloat16).reshape(-1, x.shape[-1])
+                flat_routes = plan.remapped.reshape(-1, route_width).astype(mx.uint32)
+                if flat_x.shape[0] != flat_routes.shape[0]:
+                    raise ContractError(
+                        "ScaleX token and routed-index counts differ during prefill"
+                    )
+                token_outputs = []
+                for token in range(flat_x.shape[0]):
+                    token_x = flat_x[token : token + 1]
+                    routes = flat_routes[token]
+                    gate = mx._expert_ssd_scalex_mxfp4_qmv(
+                        token_x,
+                        by_name["gate_proj.weight"],
+                        by_name["scalex_record"],
+                        routes,
+                        0,
+                    )
+                    up = mx._expert_ssd_scalex_mxfp4_qmv(
+                        token_x,
+                        by_name["up_proj.weight"],
+                        by_name["scalex_record"],
+                        routes,
+                        2,
+                    )
+                    activated = limited_swiglu(gate, up, self.swiglu_limit)
+                    output = mx._expert_ssd_scalex_mxfp4_qmv(
+                        activated,
+                        by_name["down_proj.weight"],
+                        by_name["scalex_record"],
+                        routes,
+                        1,
+                    )
+                    token_outputs.append(output.reshape(route_width, x.shape[-1]))
+                return mx.stack(token_outputs, axis=0).reshape(
+                    *plan.remapped.shape,
+                    x.shape[-1],
+                )
+
             if production_native_qmv:
                 routes = plan.remapped.reshape(-1).astype(mx.uint32)
                 up, gate = mx._expert_ssd_mxfp4_pair_qmv(
@@ -580,6 +716,13 @@ class NativeExpertSSD(nn.Module):
                     x.shape[-1],
                 ).squeeze(-2)
 
+            if self.source.scalex_mode_b:
+                raise ContractError(
+                    "ScaleX Mode B received unsupported QMV geometry: "
+                    f"dtype={x.dtype}, shape={tuple(x.shape)}, "
+                    f"up_weight={tuple(by_name['up_proj.weight'].shape)}"
+                )
+
             expanded = mx.expand_dims(x, (-2, -3))
 
             def qmm(value: mx.array, projection: str) -> mx.array:
@@ -601,6 +744,46 @@ class NativeExpertSSD(nn.Module):
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         return self.finish(x, self.prepare(indices))
+
+    def finish_width2_merged(
+        self,
+        x: mx.array,
+        plan: NativeRoutePlan,
+        scores: mx.array,
+        shared: mx.array,
+    ) -> mx.array:
+        """Top-8 ScaleX width-two down projection and mixture reduction."""
+
+        if (
+            not self.source.scalex_mode_b
+            or x.shape != (2, 4096)
+            or plan.remapped.shape != (2, 8)
+        ):
+            raise ContractError("GLM fused verifier requires width-two/top-eight ScaleX")
+        self._finish_refill(plan)
+        by_name = {
+            name: self.slots[index]
+            for index, (name, _, _) in enumerate(self.source.tensor_layouts)
+        }
+        flat_x = x.astype(mx.bfloat16)
+        flat_routes = plan.remapped.reshape(2, 8).astype(mx.uint32)
+        up, gate = mx._expert_ssd_scalex_mxfp4_width2_pair_qmv(
+            mx.contiguous(flat_x),
+            by_name["up_proj.weight"],
+            by_name["gate_proj.weight"],
+            by_name["scalex_record"],
+            mx.contiguous(flat_routes.reshape(-1)),
+        )
+        activated = limited_swiglu(gate, up, self.swiglu_limit)
+        return mx._expert_ssd_scalex_mxfp4_width2_down_reduce(
+            mx.contiguous(activated),
+            by_name["down_proj.weight"],
+            by_name["scalex_record"],
+            flat_routes.reshape(-1),
+            flat_routes.reshape(-1),
+            mx.contiguous(scores.reshape(-1).astype(mx.float32)),
+            mx.contiguous(shared.reshape(2, 1, 4096).astype(mx.bfloat16)),
+        ).squeeze(1)
 
     def stats(self) -> ExpertCacheStats:
         return ExpertCacheStats(

@@ -21,6 +21,7 @@ dev = ["pytest>=9,<10"]
 [project.scripts]
 livglm = "glm53flash.chat_cli:entrypoint"
 livglm-trace-summary = "glm53flash.trace_summary:main"
+livglm-converter = "glm53flash.converter_cli:entrypoint"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

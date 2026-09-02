@@ -9,7 +9,7 @@ overlay_dir="$project_root/native/testsite"
 build_dir="$source_dir/build"
 wheel_stage="$project_root/native/.dist-stage.$$"
 overlay_stage="$project_root/native/.testsite-stage.$$"
-revision="7588c17195819353035bfc28c1226e8404687343"
+revision="1b0930d12f6a3e84f88dfb4a66ae9380cb39d4cd"
 
 required_native_smoke() {
   PYTHONPATH="$overlay_dir:$project_root/src" "$python_bin" - <<'PY'
@@ -26,6 +26,10 @@ required = (
     "_expert_ssd_route_cache_plan",
     "_expert_ssd_mxfp4_pair_qmv",
     "_expert_ssd_mxfp4_masked_qmv",
+    "_expert_ssd_mxfp4_two_row_qmv",
+    "_expert_ssd_two_row_gemv",
+    "_expert_ssd_scalex_mxfp4_width2_pair_qmv",
+    "_expert_ssd_scalex_mxfp4_width2_down_reduce",
     "_expert_ssd_wire_arrays",
     "_expert_ssd_unwire_arrays",
 )
