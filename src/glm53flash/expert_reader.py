@@ -12,6 +12,7 @@ import numpy as np
 
 from .contract import ContractError
 from .expert_source import NativeExpertSourcePlan
+from .scale_codec import decode_mode_a
 
 
 PROJECTIONS = ("down_proj", "gate_proj", "up_proj")
@@ -126,21 +127,55 @@ class NativeExpertReader:
         before_system = self._system_reads
         before_bytes = self._read_bytes
         tensors: dict[str, mx.array] = {}
-        for source_range in source.read_ranges:
+        if source.scalex_record is None:
+            for source_range in source.read_ranges:
+                raw = self._pread_exact(
+                    source_range.shard_name,
+                    source_range.absolute_offset,
+                    source_range.byte_length,
+                )
+                view = memoryview(raw)
+                for tensor in source_range.tensors:
+                    relative = source_range.relative_offset(tensor)
+                    tensor_raw = view[relative : relative + tensor.byte_length]
+                    tensors[tensor.destination_name] = self._array(
+                        tensor_raw,
+                        tensor.mlx_dtype,
+                        tensor.mlx_shape,
+                    )
+        else:
+            if len(source.read_ranges) != 1:
+                raise ContractError("ScaleX expert must occupy one physical range")
+            record = source.scalex_record
+            source_range = source.read_ranges[0]
             raw = self._pread_exact(
                 source_range.shard_name,
                 source_range.absolute_offset,
                 source_range.byte_length,
             )
-            view = memoryview(raw)
-            for tensor in source_range.tensors:
-                relative = source_range.relative_offset(tensor)
-                tensor_raw = view[relative : relative + tensor.byte_length]
+            by_source = {tensor.source_name: tensor for tensor in source.tensors}
+            decoded_scales = memoryview(decode_mode_a(raw[: record.encoded_bytes]))
+            cursor = 0
+            for name, length in zip(record.scale_names, record.scale_nbytes, strict=True):
+                tensor = by_source[name]
                 tensors[tensor.destination_name] = self._array(
-                    tensor_raw,
+                    decoded_scales[cursor : cursor + length],
                     tensor.mlx_dtype,
                     tensor.mlx_shape,
                 )
+                cursor += length
+            cursor = record.encoded_bytes
+            raw_view = memoryview(raw)
+            for name, length in zip(record.weight_names, record.weight_nbytes, strict=True):
+                tensor = by_source[name]
+                tensors[tensor.destination_name] = self._array(
+                    raw_view[cursor : cursor + length],
+                    tensor.mlx_dtype,
+                    tensor.mlx_shape,
+                )
+                cursor += length
+            if cursor != len(raw):
+                raise ContractError("ScaleX expert record has trailing bytes")
         expected = {
             f"{projection}.{part}"
             for projection in PROJECTIONS

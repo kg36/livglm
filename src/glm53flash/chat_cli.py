@@ -102,9 +102,19 @@ def _print_stats(stats) -> None:
         if stats.decode_forwards
         else "n/a"
     )
+    steady_rate = (
+        f", steady={stats.steady_decode_tokens_per_second:.3f} tok/s"
+        if stats.steady_decode_tokens
+        else ""
+    )
+    speculation = (
+        f", MTP={stats.drafts_accepted}/{stats.speculative_cycles} accepted"
+        if stats.speculative_cycles
+        else ""
+    )
     print(
         f"\n[prompt={stats.prompt_tokens}, generated={stats.generated_tokens}, "
-        f"prefill={prefill_rate:.3f} tok/s, decode={decode_rate}, "
+        f"prefill={prefill_rate:.3f} tok/s, decode={decode_rate}{steady_rate}, "
         f"end-to-end={stats.tokens_per_second:.3f} output tok/s; "
         f"ExpertSSD={reader.backend}, loads={reader.expert_loads}, "
         f"reads={reader.logical_reads}, "
@@ -117,25 +127,44 @@ def _print_stats(stats) -> None:
         f"decode-SSD-wait={stats.decode_reader.io_wait_seconds:.3f}s, "
         f"decode-bandwidth={decode_bandwidth:.2f} GB/s, "
         f"route-sync={route_sync:.3f}s (decode {decode_route_sync:.3f}s), "
-        f"slot-plan={slot_plan:.3f}s, "
+        f"slot-plan={slot_plan:.3f}s{speculation}, "
         f"MLX={stats.active_memory_bytes / 2**30:.2f}/"
         f"{stats.peak_memory_bytes / 2**30:.2f} GiB active/peak]",
         file=sys.stderr,
     )
 
 
-def _streamer(tokenizer):
-    previous = ""
+class _IncrementalStreamer:
+    """ByteLevel token-piece streaming without quadratic prefix decoding."""
 
-    def emit(_token: int, generated: list[int]) -> None:
-        nonlocal previous
-        current = tokenizer.decode(generated, skip_special_tokens=True)
-        suffix = current[len(previous) :] if current.startswith(previous) else current
-        if suffix:
-            print(suffix, end="", flush=True)
-        previous = current
+    def __init__(self, tokenizer):
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        self.decoder = getattr(backend, "decoder", None)
+        if self.decoder is None:
+            raise ContractError("tokenizer has no incremental ByteLevel decoder")
+        self.tokenizer = tokenizer
+        self.special_ids = frozenset(int(value) for value in tokenizer.all_special_ids)
+        self.pending: list[str] = []
 
-    return emit
+    def __call__(self, token: int, _generated: list[int]) -> None:
+        token = int(token)
+        if token in self.special_ids:
+            return
+        piece = self.tokenizer.convert_ids_to_tokens(token)
+        if not isinstance(piece, str):
+            raise ContractError(f"tokenizer returned no piece for token {token}")
+        self.pending.append(piece)
+        decoded = str(self.decoder.decode(self.pending))
+        if "\ufffd" in decoded:
+            return
+        self.pending.clear()
+        if decoded:
+            print(decoded, end="", flush=True)
+
+    def finish(self) -> None:
+        if self.pending:
+            print(str(self.decoder.decode(self.pending)), end="", flush=True)
+            self.pending.clear()
 
 
 def _one_turn(
@@ -149,14 +178,16 @@ def _one_turn(
     external_profile_go: Path | None = None,
 ) -> str:
     prompt_ids = runtime.encode_messages(messages, thinking=thinking)
+    streamer = _IncrementalStreamer(runtime.tokenizer)
     generated, stats = runtime.generate(
         prompt_ids,
         max_new_tokens=maximum,
-        on_token=_streamer(runtime.tokenizer),
+        on_token=streamer,
         trace=trace,
         external_profile_ready=external_profile_ready,
         external_profile_go=external_profile_go,
     )
+    streamer.finish()
     print(flush=True)
     _print_stats(stats)
     return runtime.tokenizer.decode(generated, skip_special_tokens=True)
@@ -173,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
             memory_gib=args.memory,
             resident_mxfp8=not args.resident_bf16,
             resident_mxfp4=args.resident_mxfp4,
+            enable_mtp=True,
         )
         print(json.dumps(result.as_dict(), indent=2))
         return 0
@@ -199,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Loading GLM-5.3-Flash resident weights; routed experts stay on SSD "
         f"({resident_label} resident, "
-        "native MXFP4 ExpertSSD, no ScaleX)…",
+        "native MXFP4 ExpertSSD, ScaleX auto-detect)…",
         file=sys.stderr,
         flush=True,
     )
@@ -208,12 +240,15 @@ def main(argv: list[str] | None = None) -> int:
         memory_gib=args.memory,
         resident_mxfp8=not args.resident_bf16,
         resident_mxfp4=args.resident_mxfp4,
+        enable_mtp=True,
     )
     print(
         f"Ready: {runtime.profile.resident_gib:.2f} GiB "
         f"{runtime.profile.resident_format.upper()} resident, "
         f"{runtime.profile.expert_capacity} ExpertSSD slots/layer, "
         f"{runtime.profile.expert_cache_gib:.2f} GiB expert cache, "
+        f"{runtime.profile.expert_source_format} experts, "
+        f"MTP width-two verification, "
         f"{runtime.profile.planned_gib:.2f}/{runtime.profile.effective_gib:.2f} "
         f"GiB planned, {runtime.active_memory_bytes / 2**30:.2f} GiB active, "
         f"{runtime.profile.context_limit}-token v1 context.",

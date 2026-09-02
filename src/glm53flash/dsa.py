@@ -96,28 +96,34 @@ class DenseEquivalentDSAAttention(nn.Module):
         return DSACache()
 
     def __call__(self, hidden_states: mx.array, cache: DSACache) -> mx.array:
-        if hidden_states.ndim != 3 or hidden_states.shape[:2] != (1, 1):
-            raise ContractError("v1 DSA requires batch=1 and token-at-a-time execution")
-        next_length = cache.length + 1
+        if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+            raise ContractError("v1 DSA requires batch size one")
+        width = hidden_states.shape[1]
+        if width < 1:
+            raise ContractError("v1 DSA requires one or more causal tokens")
+        prefix_length = cache.length
+        next_length = prefix_length + width
         if not dense_short_context_is_exact(
             history_length=next_length,
             index_topk=self.context_limit,
+            token_at_a_time=width == 1,
         ):
-            raise ContractError(
-                f"v1 DSA dense-equivalence domain exceeded at token {next_length}; "
-                f"hard limit is {self.context_limit}"
-            )
+            if next_length > self.context_limit:
+                raise ContractError(
+                    f"v1 DSA dense-equivalence domain exceeded at token {next_length}; "
+                    f"hard limit is {self.context_limit}"
+                )
 
         q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))
         query = self.q_b_proj(q_resid)
-        query = query.reshape(1, 1, self.num_heads, self.qk_head_dim)
+        query = query.reshape(1, width, self.num_heads, self.qk_head_dim)
         query = mx.swapaxes(query, 1, 2)
 
         compressed = self.kv_a_layernorm(self.kv_a_proj_with_mqa(hidden_states))
         expanded = self.kv_b_proj(compressed)
         expanded = expanded.reshape(
             1,
-            1,
+            width,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
@@ -125,16 +131,26 @@ class DenseEquivalentDSAAttention(nn.Module):
         key, value = mx.split(expanded, (self.qk_nope_head_dim,), axis=-1)
         cache.keys = key if cache.keys is None else mx.concatenate((cache.keys, key), axis=2)
         cache.values = value if cache.values is None else mx.concatenate((cache.values, value), axis=2)
+        if width > 1:
+            cache._speculative_first = (
+                cache.keys[:, :, : prefix_length + 1],
+                cache.values[:, :, : prefix_length + 1],
+            )
 
         scores = mx.matmul(
             query.astype(mx.float32),
             mx.swapaxes(cache.keys.astype(mx.float32), -1, -2),
         ) * self.scaling
+        if width > 1:
+            key_positions = mx.arange(next_length)[None, :]
+            query_positions = (prefix_length + mx.arange(width))[:, None]
+            causal = key_positions <= query_positions
+            scores = mx.where(causal[None, None, :, :], scores, -float("inf"))
         probabilities = mx.softmax(scores, axis=-1).astype(query.dtype)
         attended = mx.matmul(probabilities, cache.values)
         attended = mx.swapaxes(attended, 1, 2).reshape(
             1,
-            1,
+            width,
             self.num_heads * self.v_head_dim,
         )
         return self.o_proj(attended)

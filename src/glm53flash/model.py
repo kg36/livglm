@@ -166,13 +166,14 @@ class GLMTextModel(nn.Module):
         )
 
     def __call__(self, input_ids: mx.array, cache: ModelCache) -> mx.array:
-        if input_ids.ndim != 2 or input_ids.shape[1] != 1:
-            raise ContractError("v1 model execution accepts exactly one token per call")
+        if input_ids.ndim != 2 or input_ids.shape[1] < 1:
+            raise ContractError("model execution accepts one or more causal tokens")
         if input_ids.shape[0] != 1:
             raise ContractError("v1 model execution supports batch size one")
-        if cache.position >= self.context_limit:
+        width = input_ids.shape[1]
+        if cache.position + width > self.context_limit:
             raise ContractError(
-                f"v1 context limit exceeded: {cache.position + 1} > {self.context_limit}"
+                f"v1 context limit exceeded: {cache.position + width} > {self.context_limit}"
             )
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = mx.broadcast_to(
@@ -185,7 +186,7 @@ class GLMTextModel(nn.Module):
             # refill. The final logits barrier materializes the last layer and
             # every recurrent/cache update, so an additional finite-value GPU
             # round trip at every layer is redundant.
-        cache.advance()
+        cache.advance(width)
         return self.norm(self.hc_head(hidden_states))
 
 
@@ -209,8 +210,16 @@ class GLMForCausalLM(nn.Module):
     def empty_cache(self, *, batch_size: int = 1) -> ModelCache:
         return self.language_model.empty_cache(batch_size=batch_size)
 
-    def __call__(self, input_ids: mx.array, cache: ModelCache) -> mx.array:
-        return self.lm_head(self.language_model(input_ids, cache))
+    def __call__(
+        self,
+        input_ids: mx.array,
+        cache: ModelCache,
+        *,
+        return_hidden: bool = False,
+    ) -> mx.array | tuple[mx.array, mx.array]:
+        hidden = self.language_model(input_ids, cache)
+        logits = self.lm_head(hidden)
+        return (logits, hidden) if return_hidden else logits
 
     def expert_layers(self) -> tuple[ExpertSSDMoE, ...]:
         values = [layer.mlp for layer in self.language_model.layers]

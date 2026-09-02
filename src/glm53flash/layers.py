@@ -39,15 +39,30 @@ class DeferredLinear(nn.Module):
         weight = require_weight(self.weight, "linear.weight")
         if self.quantization_mode in {"mxfp4", "mxfp8"}:
             bits = 4 if self.quantization_mode == "mxfp4" else 8
-            result = mx.quantized_matmul(
-                x,
-                weight,
-                require_weight(self.scales, "linear.scales"),
-                transpose=True,
-                group_size=32,
-                bits=bits,
-                mode=self.quantization_mode,
-            )
+            two_row = getattr(mx, "_expert_ssd_mxfp4_two_row_qmv", None)
+            if (
+                bits == 4
+                and two_row is not None
+                and x.ndim >= 2
+                and x.size == 2 * self.input_dims
+                and self.input_dims % 512 == 0
+                and self.output_dims % 8 == 0
+            ):
+                result = two_row(
+                    mx.contiguous(x.reshape(2, self.input_dims)),
+                    mx.contiguous(weight),
+                    mx.contiguous(require_weight(self.scales, "linear.scales")),
+                ).reshape(*x.shape[:-1], self.output_dims)
+            else:
+                result = mx.quantized_matmul(
+                    x,
+                    weight,
+                    require_weight(self.scales, "linear.scales"),
+                    transpose=True,
+                    group_size=32,
+                    bits=bits,
+                    mode=self.quantization_mode,
+                )
         else:
             result = x @ weight.T
         if self.bias is not False:

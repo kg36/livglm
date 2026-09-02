@@ -25,7 +25,11 @@ class HyperConnection(nn.Module):
         dtype = streams.dtype
         flat = self.input_norm(mx.flatten(streams, start_axis=2))
         fn = require_weight(self.fn, "hyper_connection.fn").astype(mx.float32)
-        mixed = flat @ fn.T
+        two_row = getattr(mx, "_expert_ssd_two_row_gemv", None)
+        if two_row is not None and flat.size == 2 * flat.shape[-1]:
+            mixed = two_row(mx.contiguous(flat), mx.contiguous(fn))
+        else:
+            mixed = flat @ fn.T
         pre_w, post_w, comb_w = mx.split(mixed, (hc, 2 * hc), axis=-1)
         base = require_weight(self.base, "hyper_connection.base").astype(mx.float32)
         pre_b, post_b, comb_b = mx.split(base, (hc, 2 * hc), axis=-1)

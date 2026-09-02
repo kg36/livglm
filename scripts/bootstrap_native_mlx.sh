@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=${0:A:h:h}
 source_dir=${LIVGLM_NATIVE_MLX_SOURCE_DIR:-"$project_root/native/mlx-io-glm"}
 repository="https://github.com/kg36/mlx-io-glm.git"
-revision="7588c17195819353035bfc28c1226e8404687343"
+revision="1b0930d12f6a3e84f88dfb4a66ae9380cb39d4cd"
 
 if [[ -e "$source_dir" ]]; then
   if ! git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then

@@ -18,6 +18,8 @@ from .expert_source import NativeExpertSourcePlan, build_native_expert_source_pl
 from .expert_ssd import ExpertCacheStats
 from .model import GLMForCausalLM
 from .model_config import GLMTextConfig
+from .mtp import GLMNextTokenPredictor
+from .mtp_resident import build_mtp_resident_source_plan
 from .native_expert_ssd import NativeExpertPool, NativeExpertSSD
 from .resident_plan import ResidentSourcePlan, build_resident_source_plan
 from .resident_reader import NativeResidentReader, ResidentReaderStats
@@ -27,11 +29,16 @@ from .trace import DecodeTrace
 DEFAULT_MODEL_DIR = Path("/Users/kumargaurav/Documents/livglm/GLM53Flash")
 DEFAULT_MEMORY_GIB = 24.0
 SYSTEM_RESERVE_GIB = 4.0
-RUNTIME_RESERVE_GIB = 3.0
+# The live 128-token runtime needs about 0.22 GiB beyond resident tensors and
+# ExpertSSD rows. Keep more than twice that measured requirement while using
+# the user's --memory ceiling instead of leaving 3 GiB permanently idle.
+RUNTIME_RESERVE_GIB = 0.5
 CONTEXT_LIMIT = 128
 EXPERT_SLOT_BYTES = 13_369_344
 MOE_LAYER_COUNT = 42
 MINIMUM_EXPERT_CAPACITY = 8
+MTP_EXPERT_CAPACITY = 48
+MTP_AUXILIARY_GIB = 0.75
 
 
 def _metal_profile_counts() -> dict[str, int]:
@@ -78,6 +85,9 @@ class RuntimeProfile:
     resident_load_gib: float
     resident_linear_count: int
     runtime_reserve_gib: float
+    auxiliary_gib: float
+    expert_source_format: str
+    expert_slot_bytes_by_layer: tuple[int, ...]
     expert_capacity: int
     expert_cache_gib: float
     planned_gib: float
@@ -104,7 +114,10 @@ def resolve_runtime_profile(
     resident_load_bytes: int | None = None,
     resident_format: str = "bf16",
     resident_linear_count: int = 0,
+    expert_source_format: str = "native_mxfp4",
+    expert_slot_bytes_by_layer: tuple[int, ...] | None = None,
     physical_bytes: int | None = None,
+    auxiliary_gib: float = 0.0,
 ) -> RuntimeProfile:
     physical_gib = (physical_bytes or physical_memory_bytes()) / 2**30
     requested = DEFAULT_MEMORY_GIB if requested_gib is None else float(requested_gib)
@@ -113,21 +126,35 @@ def resolve_runtime_profile(
     effective = min(requested, physical_gib - SYSTEM_RESERVE_GIB)
     resident_gib = resident_bytes / 2**30
     resident_load_gib = (resident_load_bytes or resident_bytes) / 2**30
-    available = (effective - resident_gib - RUNTIME_RESERVE_GIB) * 2**30
-    affordable_capacity = math.floor(available / (MOE_LAYER_COUNT * EXPERT_SLOT_BYTES))
+    slot_bytes = (
+        (EXPERT_SLOT_BYTES,) * MOE_LAYER_COUNT
+        if expert_slot_bytes_by_layer is None
+        else tuple(int(value) for value in expert_slot_bytes_by_layer)
+    )
+    if len(slot_bytes) != MOE_LAYER_COUNT or any(value <= 0 for value in slot_bytes):
+        raise ContractError("expert slot geometry must cover 42 positive layer rows")
+    bank_bytes = sum(slot_bytes)
+    auxiliary = float(auxiliary_gib)
+    if not math.isfinite(auxiliary) or auxiliary < 0:
+        raise ContractError("auxiliary runtime reservation must be non-negative")
+    available = (
+        effective - resident_gib - RUNTIME_RESERVE_GIB - auxiliary
+    ) * 2**30
+    affordable_capacity = math.floor(available / bank_bytes)
     if affordable_capacity < MINIMUM_EXPERT_CAPACITY:
         minimum = (
             resident_gib
             + RUNTIME_RESERVE_GIB
-            + MINIMUM_EXPERT_CAPACITY * MOE_LAYER_COUNT * EXPERT_SLOT_BYTES / 2**30
+            + auxiliary
+            + MINIMUM_EXPERT_CAPACITY * bank_bytes / 2**30
         )
         raise ContractError(
             f"memory budget leaves capacity {affordable_capacity}, below routed top-k 8; "
             f"use at least {minimum:.1f} GiB"
         )
     capacity = min(EXPERTS_PER_LAYER, affordable_capacity)
-    cache_gib = capacity * MOE_LAYER_COUNT * EXPERT_SLOT_BYTES / 2**30
-    planned_gib = resident_gib + RUNTIME_RESERVE_GIB + cache_gib
+    cache_gib = capacity * bank_bytes / 2**30
+    planned_gib = resident_gib + RUNTIME_RESERVE_GIB + auxiliary + cache_gib
     headroom_gib = effective - planned_gib
     if headroom_gib < -1e-9:
         raise ContractError(
@@ -143,6 +170,9 @@ def resolve_runtime_profile(
         resident_load_gib=resident_load_gib,
         resident_linear_count=resident_linear_count,
         runtime_reserve_gib=RUNTIME_RESERVE_GIB,
+        auxiliary_gib=auxiliary,
+        expert_source_format=expert_source_format,
+        expert_slot_bytes_by_layer=slot_bytes,
         expert_capacity=capacity,
         expert_cache_gib=cache_gib,
         planned_gib=planned_gib,
@@ -163,8 +193,12 @@ class PreflightResult:
             "resident": self.resident_plan.as_dict(),
             "experts": self.expert_plan.as_dict(),
             "profile": self.profile.as_dict(),
-            "expert_backend": "mlx-io-glm/direct-to-slot/native-MXFP4",
-            "scalex": False,
+            "expert_backend": (
+                "mlx-io-glm/direct-to-slot/ScaleX-Mode-B"
+                if self.expert_plan.scalex_mode_b
+                else "mlx-io-glm/direct-to-slot/native-MXFP4"
+            ),
+            "scalex": self.expert_plan.scalex_mode_b,
         }
 
 
@@ -176,6 +210,11 @@ class GenerationStats:
     prefill_seconds: float
     decode_seconds: float
     decode_forwards: int
+    steady_decode_seconds: float
+    steady_decode_tokens: int
+    speculative_cycles: int
+    drafts_accepted: int
+    drafts_rejected: int
     stopped_on_eos: bool
     reader: ReaderStats
     prefill_reader: ReaderStats
@@ -192,7 +231,16 @@ class GenerationStats:
 
     @property
     def decode_tokens_per_second(self) -> float:
-        return self.decode_forwards / self.decode_seconds if self.decode_seconds else 0.0
+        decoded = max(0, self.generated_tokens - 1)
+        return decoded / self.decode_seconds if self.decode_seconds else 0.0
+
+    @property
+    def steady_decode_tokens_per_second(self) -> float:
+        return (
+            self.steady_decode_tokens / self.steady_decode_seconds
+            if self.steady_decode_seconds
+            else 0.0
+        )
 
 
 def _reader_delta(after: ReaderStats, before: ReaderStats) -> ReaderStats:
@@ -248,6 +296,8 @@ class TargetRuntime:
         tokenizer,
         active_memory_bytes: int,
         peak_memory_bytes: int,
+        mtp: GLMNextTokenPredictor | None = None,
+        mtp_reader: NativeExpertPool | None = None,
     ):
         self.model_dir = model_dir
         self.config = config
@@ -259,6 +309,8 @@ class TargetRuntime:
         self.tokenizer = tokenizer
         self.active_memory_bytes = active_memory_bytes
         self.peak_memory_bytes = peak_memory_bytes
+        self.mtp = mtp
+        self.mtp_reader = mtp_reader
 
     @classmethod
     def preflight(
@@ -269,6 +321,7 @@ class TargetRuntime:
         physical_bytes: int | None = None,
         resident_mxfp8: bool = True,
         resident_mxfp4: bool = False,
+        enable_mtp: bool = False,
     ) -> PreflightResult:
         contract = ModelContract.from_model_dir(model_dir)
         contract.validate_supported_profile()
@@ -291,7 +344,10 @@ class TargetRuntime:
             resident_linear_count=(
                 resident.mxfp8_linear_count if resident_format != "bf16" else 0
             ),
+            expert_source_format=experts.source_format,
+            expert_slot_bytes_by_layer=experts.slot_bytes_by_layer,
             physical_bytes=physical_bytes,
+            auxiliary_gib=MTP_AUXILIARY_GIB if enable_mtp else 0.0,
         )
         return PreflightResult(str(contract.model_dir), resident, experts, profile)
 
@@ -303,16 +359,20 @@ class TargetRuntime:
         memory_gib: float | None = None,
         resident_mxfp8: bool = True,
         resident_mxfp4: bool = False,
+        enable_mtp: bool = False,
     ) -> "TargetRuntime":
         preflight = cls.preflight(
             model_dir,
             memory_gib=memory_gib,
             resident_mxfp8=resident_mxfp8,
             resident_mxfp4=resident_mxfp4,
+            enable_mtp=enable_mtp,
         )
         contract = ModelContract.from_model_dir(preflight.model_dir)
         config = GLMTextConfig.from_model_dict(contract.config)
         expert_reader = NativeExpertPool(preflight.expert_plan, workers=8)
+        mtp_reader = None
+        mtp = None
         memory_limit_bytes = int(preflight.profile.effective_gib * 2**30)
 
         def make_experts(layer: int) -> NativeExpertSSD:
@@ -369,9 +429,36 @@ class TargetRuntime:
                     "source_bytes": 0,
                     "destination_bytes": 0,
                 }
+            if enable_mtp:
+                mtp_expert_plan = build_native_expert_source_plan(
+                    contract,
+                    config,
+                    first_layer=45,
+                    last_layer=45,
+                )
+                mtp_reader = NativeExpertPool(mtp_expert_plan, workers=8)
+
+                def make_mtp_experts(layer: int) -> NativeExpertSSD:
+                    return NativeExpertSSD(
+                        mtp_reader,
+                        layer=layer,
+                        capacity=MTP_EXPERT_CAPACITY,
+                        swiglu_limit=config.swiglu_limit,
+                        defer_slots=True,
+                    )
+
+                mtp = GLMNextTokenPredictor(config, make_mtp_experts)
+                NativeResidentReader(
+                    build_mtp_resident_source_plan(contract)
+                ).load_into(mtp)
+                mtp.quantize_resident_linears_mxfp4()
+                mtp.experts.activate()
             for expert_layer in model.expert_layers():
                 expert_layer.experts.activate()
-            mx.eval(model.parameters())
+            if mtp is None:
+                mx.eval(model.parameters())
+            else:
+                mx.eval(model.parameters(), mtp.parameters())
             try:
                 mx.clear_cache()
             except AttributeError:
@@ -389,6 +476,8 @@ class TargetRuntime:
                 for expert_layer in model.expert_layers():
                     expert_layer.experts.close()
             expert_reader.close()
+            if mtp_reader is not None:
+                mtp_reader.close()
             raise
         return cls(
             model_dir=Path(preflight.model_dir),
@@ -401,12 +490,18 @@ class TargetRuntime:
             tokenizer=tokenizer,
             active_memory_bytes=active_memory_bytes,
             peak_memory_bytes=peak_memory_bytes,
+            mtp=mtp,
+            mtp_reader=mtp_reader,
         )
 
     def close(self) -> None:
         for layer in self.model.expert_layers():
             layer.experts.close()
         self.expert_reader.close()
+        if self.mtp is not None:
+            self.mtp.experts.close()
+        if self.mtp_reader is not None:
+            self.mtp_reader.close()
 
     def encode_messages(self, messages: list[dict[str, str]], *, thinking: bool) -> list[int]:
         encoded = self.tokenizer.apply_chat_template(
@@ -456,13 +551,30 @@ class TargetRuntime:
             )
 
         cache = self.model.empty_cache()
+        mtp_cache = self.mtp.empty_cache() if self.mtp is not None else None
         logits = None
+        hidden = None
+        previous_hidden = None
         reader_start = self.expert_reader.stats()
         caches_start = tuple(layer.experts.stats() for layer in self.model.expert_layers())
         started = time.perf_counter()
         for token in prompt_ids:
-            logits = self.model(mx.array([[token]], dtype=mx.int32), cache)
-            mx.eval(logits)
+            token_array = mx.array([[token]], dtype=mx.int32)
+            if self.mtp is None:
+                logits = self.model(token_array, cache)
+                mx.eval(logits)
+            else:
+                logits, hidden = self.model(
+                    token_array,
+                    cache,
+                    return_hidden=True,
+                )
+                mx.eval(logits, hidden)
+                if previous_hidden is not None:
+                    embedding = self.model.language_model.embed_tokens(token_array)
+                    warm = self.mtp(embedding, previous_hidden, mtp_cache)
+                    mx.eval(warm)
+                previous_hidden = hidden
             if not bool(mx.all(mx.isfinite(logits)).item()):
                 raise ContractError("non-finite output logits during prompt execution")
         assert logits is not None
@@ -480,105 +592,188 @@ class TargetRuntime:
         generated: list[int] = []
         stopped = False
         decode_forwards = 0
+        speculative_cycles = 0
+        drafts_accepted = 0
+        drafts_rejected = 0
         decode_started = time.perf_counter()
-        for step in range(limit):
-            token = int(mx.argmax(logits[0, -1], axis=-1).item())
-            generated.append(token)
-            if on_token is not None:
-                on_token(token, generated)
-            if token in self.config.eos_token_ids:
-                stopped = True
-                break
-            if step + 1 < limit:
+        steady_started: float | None = None
+        steady_token_start = 0
+        if self.mtp is not None:
+            assert hidden is not None and mtp_cache is not None
+            while len(generated) < limit:
+                token = int(mx.argmax(logits[0, -1], axis=-1).item())
+                generated.append(token)
+                if on_token is not None:
+                    on_token(token, generated)
+                if token in self.config.eos_token_ids:
+                    stopped = True
+                    break
+                if len(generated) >= limit:
+                    break
+
+                cycle = speculative_cycles
                 trace_context = (
-                    trace.decode_step(step, token_id=token)
+                    trace.decode_step(cycle, token_id=token)
                     if trace is not None
                     else nullcontext(False)
                 )
                 with trace_context as tracing:
-                    if tracing:
-                        step_reader_before = self.expert_reader.stats()
-                        step_caches_before = tuple(
-                            layer.experts.stats()
-                            for layer in self.model.expert_layers()
+                    draft_context = (
+                        trace.span(
+                            "mtp_draft",
+                            category="mtp",
+                            args={"decode_index": cycle, "depth": 1},
                         )
-                        metal_before = _metal_profile_counts()
+                        if tracing and trace is not None
+                        else nullcontext({})
+                    )
+                    with draft_context:
+                        token_array = mx.array([[token]], dtype=mx.int32)
+                        embedding = self.model.language_model.embed_tokens(
+                            token_array
+                        )
+                        draft_hidden = self.mtp(embedding, hidden, mtp_cache)
+                        draft_logits = self.model.lm_head(draft_hidden)
+                        mx.eval(draft_logits)
+                        draft = int(
+                            mx.argmax(draft_logits[0, -1], axis=-1).item()
+                        )
+
+                    snapshot = cache.snapshot()
                     forward_context = (
                         trace.span(
                             "model_forward",
                             category="python",
                             args={
-                                "decode_index": step,
-                                "semantics": (
-                                    "Python forward including route GPU waits, SSD "
-                                    "joins, and lazy MLX graph construction"
-                                ),
+                                "decode_index": cycle,
+                                "width": 2,
+                                "semantics": "MTP draft plus exact target verification",
                             },
                         )
                         if tracing and trace is not None
                         else nullcontext({})
                     )
                     with forward_context:
-                        logits = self.model(
-                            mx.array([[token]], dtype=mx.int32),
+                        verify_logits, verify_hidden = self.model(
+                            mx.array([[token, draft]], dtype=mx.int32),
                             cache,
+                            return_hidden=True,
                         )
                     eval_context = (
                         trace.span(
                             "final_logits_eval_wait",
                             category="gpu_sync",
-                            args={
-                                "decode_index": step,
-                                "semantics": (
-                                    "CPU wait for outstanding MLX GPU work; actual "
-                                    "kernel execution is in the paired Metal trace"
-                                ),
-                            },
+                            args={"decode_index": cycle, "width": 2},
                         )
                         if tracing and trace is not None
                         else nullcontext({})
                     )
                     with eval_context:
-                        mx.eval(logits)
+                        mx.eval(verify_logits, verify_hidden)
                     decode_forwards += 1
-                    if not bool(mx.all(mx.isfinite(logits)).item()):
-                        raise ContractError("non-finite output logits during generation")
-                    if tracing and trace is not None:
-                        step_reader_after = self.expert_reader.stats()
-                        step_caches_after = tuple(
-                            layer.experts.stats()
-                            for layer in self.model.expert_layers()
+                    speculative_cycles += 1
+                    if not bool(mx.all(mx.isfinite(verify_logits)).item()):
+                        raise ContractError(
+                            "non-finite output logits during speculative verification"
                         )
-                        reader_delta = _reader_delta(
-                            step_reader_after,
-                            step_reader_before,
+                    verified = int(
+                        mx.argmax(verify_logits[0, 0], axis=-1).item()
+                    )
+                    if verified == draft:
+                        drafts_accepted += 1
+                        generated.append(draft)
+                        if on_token is not None:
+                            on_token(draft, generated)
+                        logits = verify_logits[:, 1:2]
+                        hidden = verify_hidden[:, 1:2]
+                        if draft in self.config.eos_token_ids:
+                            stopped = True
+                            break
+                        catchup_context = (
+                            trace.span(
+                                "mtp_kv_catchup",
+                                category="mtp",
+                                args={"decode_index": cycle, "positions": 1},
+                            )
+                            if tracing and trace is not None
+                            else nullcontext({})
                         )
-                        cache_delta = _cache_delta(
-                            step_caches_after,
-                            step_caches_before,
+                        with catchup_context:
+                            draft_array = mx.array([[draft]], dtype=mx.int32)
+                            draft_embedding = (
+                                self.model.language_model.embed_tokens(draft_array)
+                            )
+                            anchor = self.mtp.advance_attention_cache(
+                                draft_embedding,
+                                verify_hidden[:, 0:1],
+                                mtp_cache,
+                            )
+                            mx.eval(anchor)
+                    else:
+                        drafts_rejected += 1
+                        cache.commit_first_from_wide(snapshot)
+                        logits = verify_logits[:, 0:1]
+                        hidden = verify_hidden[:, 0:1]
+                if steady_started is None and len(generated) >= 20:
+                    steady_started = time.perf_counter()
+                    steady_token_start = len(generated)
+        else:
+            for step in range(limit):
+                token = int(mx.argmax(logits[0, -1], axis=-1).item())
+                generated.append(token)
+                if on_token is not None:
+                    on_token(token, generated)
+                if token in self.config.eos_token_ids:
+                    stopped = True
+                    break
+                if step + 1 < limit:
+                    trace_context = (
+                        trace.decode_step(step, token_id=token)
+                        if trace is not None
+                        else nullcontext(False)
+                    )
+                    with trace_context as tracing:
+                        forward_context = (
+                            trace.span(
+                                "model_forward",
+                                category="python",
+                                args={"decode_index": step, "width": 1},
+                            )
+                            if tracing and trace is not None
+                            else nullcontext({})
                         )
-                        metal_after = _metal_profile_counts()
-                        values: dict[str, int | float] = {
-                            "expert_loads": reader_delta.expert_loads,
-                            "logical_read_requests": reader_delta.logical_reads,
-                            "logical_read_bytes": reader_delta.read_bytes,
-                            "expert_cache_hits": sum(item.hits for item in cache_delta),
-                            "expert_misses": sum(item.misses for item in cache_delta),
-                            "expert_evictions": sum(
-                                item.evictions for item in cache_delta
-                            ),
-                            "active_memory_bytes": int(mx.get_active_memory()),
-                            "peak_memory_bytes": int(mx.get_peak_memory()),
-                        }
-                        values.update(
-                            {
-                                f"metal_{name}": metal_after.get(name, 0)
-                                - metal_before.get(name, 0)
-                                for name in set(metal_before) | set(metal_after)
-                            }
+                        with forward_context:
+                            logits = self.model(
+                                mx.array([[token]], dtype=mx.int32),
+                                cache,
+                            )
+                        eval_context = (
+                            trace.span(
+                                "final_logits_eval_wait",
+                                category="gpu_sync",
+                                args={"decode_index": step, "width": 1},
+                            )
+                            if tracing and trace is not None
+                            else nullcontext({})
                         )
-                        trace.counter("decode_step_metrics", values)
+                        with eval_context:
+                            mx.eval(logits)
+                        decode_forwards += 1
+                        if not bool(mx.all(mx.isfinite(logits)).item()):
+                            raise ContractError(
+                                "non-finite output logits during generation"
+                            )
         decode_seconds = time.perf_counter() - decode_started
+        steady_decode_seconds = (
+            time.perf_counter() - steady_started
+            if steady_started is not None
+            else 0.0
+        )
+        steady_decode_tokens = (
+            len(generated) - steady_token_start
+            if steady_started is not None
+            else 0
+        )
         elapsed = time.perf_counter() - started
         reader_end = self.expert_reader.stats()
         caches_end = tuple(layer.experts.stats() for layer in self.model.expert_layers())
@@ -589,6 +784,11 @@ class TargetRuntime:
             prefill_seconds=prefill_seconds,
             decode_seconds=decode_seconds,
             decode_forwards=decode_forwards,
+            steady_decode_seconds=steady_decode_seconds,
+            steady_decode_tokens=steady_decode_tokens,
+            speculative_cycles=speculative_cycles,
+            drafts_accepted=drafts_accepted,
+            drafts_rejected=drafts_rejected,
             stopped_on_eos=stopped,
             reader=_reader_delta(reader_end, reader_start),
             prefill_reader=_reader_delta(reader_after_prefill, reader_start),
